@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 PORT = int(os.environ.get("PORT", 5000))
 HOST = '0.0.0.0'
 
+# Railway specific settings
+RAILWAY_STATIC_URL = os.environ.get("RAILWAY_STATIC_URL", "")
+RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+
 MAX_CLIENTS = 50
 BUFFER_SIZE = 16384
 
