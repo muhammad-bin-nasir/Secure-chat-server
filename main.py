@@ -10,19 +10,25 @@ from datetime import datetime, timedelta
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import traceback
+import sys
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(sys.stderr)
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Railway configuration
+# Railway configuration - MODIFIED FOR RAILWAY
 PORT = int(os.environ.get("PORT", 5000))
-HOST = '0.0.0.0'
+HOST = '0.0.0.0'  # Railway requires 0.0.0.0
 
-# MongoDB configuration
+# MongoDB configuration - UPDATED FOR RAILWAY MONGODB
+MONGODB_URL = os.environ.get("MONGODB_URL")  # Railway MongoDB addon provides this
 MONGODB_HOST = os.environ.get("MONGODB_HOST", "localhost")
 MONGODB_PORT = int(os.environ.get("MONGODB_PORT", "27017"))
 MONGODB_DB = os.environ.get("MONGODB_DB", "secure_chat")
@@ -53,27 +59,39 @@ MAX_ATTEMPTS_PER_IP = 10
 RATE_LIMIT_WINDOW = timedelta(minutes=15)
 
 def init_database():
-    """Initialize MongoDB connection and collections"""
+    """Initialize MongoDB connection and collections - UPDATED FOR RAILWAY"""
     global db, users_collection, messages_collection, sessions_collection
     
     try:
-        # Build MongoDB connection string
-        if MONGODB_USERNAME and MONGODB_PASSWORD:
+        # Try Railway MongoDB URL first (preferred)
+        if MONGODB_URL:
+            logger.info(f"🔐 Connecting to Railway MongoDB via URL")
+            client = MongoClient(
+                MONGODB_URL,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000
+            )
+        elif MONGODB_USERNAME and MONGODB_PASSWORD:
             # With authentication
             connection_string = f"mongodb://{MONGODB_USERNAME}:{MONGODB_PASSWORD}@{MONGODB_HOST}:{MONGODB_PORT}/"
             logger.info(f"🔐 Connecting to MongoDB with authentication at {MONGODB_HOST}:{MONGODB_PORT}")
+            client = MongoClient(
+                connection_string,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000
+            )
         else:
             # Without authentication (local development)
             connection_string = f"mongodb://{MONGODB_HOST}:{MONGODB_PORT}/"
             logger.info(f"🔓 Connecting to MongoDB without authentication at {MONGODB_HOST}:{MONGODB_PORT}")
-        
-        # Connect to MongoDB
-        client = MongoClient(
-            connection_string,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=10000,
-            socketTimeoutMS=20000
-        )
+            client = MongoClient(
+                connection_string,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000
+            )
         
         # Test the connection
         client.admin.command('ping')
@@ -103,8 +121,7 @@ def init_database():
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
         logger.warning("🔄 Falling back to in-memory storage")
-        logger.info("💡 For MongoDB setup: Install MongoDB locally or use Docker")
-        logger.info("🐳 Docker: docker run -d -p 27017:27017 --name mongodb mongo:latest")
+        logger.info("💡 For MongoDB setup on Railway: Add MongoDB addon or set MONGODB_URL")
         return False
 
 def hash_password(password):
@@ -340,7 +357,7 @@ def is_http_request(data):
         return False
 
 def send_http_response(client_socket):
-    """Send HTTP response for web browsers accessing the server"""
+    """Send HTTP response for web browsers accessing the server - UPDATED FOR RAILWAY"""
     try:
         # Get stats from database if available
         total_users = 0
@@ -357,12 +374,15 @@ def send_http_response(client_socket):
         
         # Database status
         db_status = "✅ MongoDB Connected" if db else "⚠️ In-Memory Storage"
-        db_info = f"Host: {MONGODB_HOST}:{MONGODB_PORT}" if db else "Local fallback mode"
+        
+        # Railway domain info
+        railway_domain = RAILWAY_PUBLIC_DOMAIN or f"your-app.railway.app"
         
     except:
         total_users = 0
         connected_users = 0
         db_status = "❌ Database Error"
+        railway_domain = "your-app.railway.app"
     
     response = f"""HTTP/1.1 200 OK
 Content-Type: text/html; charset=utf-8
@@ -483,12 +503,19 @@ Access-Control-Allow-Headers: Content-Type
             100% {{ opacity: 1; }}
         }}
         .online {{ animation: pulse 2s infinite; }}
+        .railway-info {{
+            background: linear-gradient(135deg, #f3e5f5 0%, #e8eaf6 100%);
+            padding: 20px;
+            border-radius: 15px;
+            border-left: 5px solid #9c27b0;
+            margin: 25px 0;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🔐 Secure Chat Server</h1>
-        <p class="status online">✅ Server is running and accepting connections!</p>
+        <p class="status online">✅ Server is running on Railway and accepting connections!</p>
         
         <div class="stats">
             <div class="stat-item">
@@ -509,22 +536,21 @@ Access-Control-Allow-Headers: Content-Type
             </div>
         </div>
         
-        <div class="info">
-            <h3>💾 Database Status</h3>
-            <p><span class="database-status">{db_status}</span></p>
-            <p><strong>Connection:</strong> {db_info}</p>
-            <p><strong>Database:</strong> {MONGODB_DB}</p>
-            <p>MongoDB provides persistent user accounts, message logging, and session management.</p>
+        <div class="railway-info">
+            <h3>🚀 Railway Deployment Info</h3>
+            <p><strong>Public Domain:</strong> {railway_domain}</p>
+            <p><strong>Environment:</strong> Railway Cloud Platform</p>
+            <p><strong>Database:</strong> <span class="database-status">{db_status}</span></p>
+            <p>Your chat server is deployed on Railway with automatic HTTPS, global CDN, and persistent storage.</p>
         </div>
         
         <div class="info">
             <h3>📱 For Desktop Clients:</h3>
             <ul>
+                <li><strong>Server Address:</strong> {railway_domain}</li>
+                <li><strong>Port:</strong> {PORT}</li>
                 <li><strong>Connection Type:</strong> TCP Socket Connection</li>
                 <li><strong>Protocol:</strong> JSON over TCP with End-to-End Encryption</li>
-                <li><strong>Client:</strong> Use the PyQt5 desktop application</li>
-                <li><strong>Server URL:</strong> This Railway domain (no http://)</li>
-                <li><strong>Port:</strong> {PORT}</li>
                 <li><strong>Security:</strong> RSA + AES-256 hybrid encryption</li>
             </ul>
         </div>
@@ -532,11 +558,11 @@ Access-Control-Allow-Headers: Content-Type
         <div class="info">
             <h3>🔧 Technical Specifications:</h3>
             <ul>
+                <li><strong>Platform:</strong> Railway Cloud with MongoDB</li>
+                <li><strong>Runtime:</strong> Python 3.11+ with PyMongo</li>
                 <li><strong>Maximum Clients:</strong> {MAX_CLIENTS} simultaneous connections</li>
                 <li><strong>Buffer Size:</strong> {BUFFER_SIZE:,} bytes per message</li>
                 <li><strong>Rate Limiting:</strong> {MAX_ATTEMPTS_PER_IP} attempts per 15 minutes</li>
-                <li><strong>Platform:</strong> Railway Cloud with MongoDB</li>
-                <li><strong>Runtime:</strong> Python 3.11+ with PyMongo</li>
                 <li><strong>Features:</strong> File transfer, Group messaging, User authentication</li>
             </ul>
         </div>
@@ -552,14 +578,6 @@ Access-Control-Allow-Headers: Content-Type
             </ul>
         </div>
         
-        <div class="info">
-            <h3>📊 System Status:</h3>
-            <p><strong>Server Uptime:</strong> Online since {datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")}</p>
-            <p><strong>Health Status:</strong> <span style="color: #28a745;">●</span> All systems operational</p>
-            <p><strong>Security Level:</strong> <span style="color: #28a745;">●</span> Maximum encryption enabled</p>
-            <p><strong>Database:</strong> {db_status}</p>
-        </div>
-        
         <div class="footer">
             <p>🚀 Deployed on Railway | 🔐 Secured by RSA-2048 + AES-256</p>
             <p>© 2024 Secure Chat Server - End-to-End Encrypted Messaging</p>
@@ -570,7 +588,7 @@ Access-Control-Allow-Headers: Content-Type
     
     try:
         client_socket.sendall(response.encode())
-        time.sleep(0.1)  # Small delay to ensure data is sent
+        time.sleep(0.1)
         client_socket.close()
     except Exception as e:
         logger.warning(f"Failed to send HTTP response: {e}")
@@ -612,7 +630,6 @@ def handle_client(client_socket, client_address):
     }
     
     try:
-        # Set longer timeout for initial data
         client_socket.settimeout(60)
         initial_data = client_socket.recv(BUFFER_SIZE)
         
@@ -622,18 +639,14 @@ def handle_client(client_socket, client_address):
         
         logger.info(f"Received {len(initial_data)} bytes from {client_address}")
         
-        # Check if this is an HTTP request (browser accessing the server)
         if is_http_request(initial_data):
             logger.info(f"HTTP request detected from {client_address}, sending web response")
             send_http_response(client_socket)
             return
         
-        # Try to parse as JSON (desktop client authentication)
         try:
-            # Handle potentially multiple JSON messages in one packet
             data_str = initial_data.decode('utf-8')
             
-            # Try to find complete JSON object
             brace_count = 0
             json_end = -1
             for i, char in enumerate(data_str):
@@ -653,7 +666,6 @@ def handle_client(client_socket, client_address):
             
             logger.info(f"Parsed auth payload from {client_address}: {list(auth_payload.keys())}")
             
-            # Validate expected authentication fields
             required_fields = ["username", "auth", "public_key"]
             missing_fields = [field for field in required_fields if field not in auth_payload]
             
@@ -673,10 +685,8 @@ def handle_client(client_socket, client_address):
             
             logger.info(f"Authentication attempt from {client_address} for user: {username}")
             
-            # Authenticate user
             auth_result = authenticate_user(username, password, public_key)
             
-            # Send authentication result
             response = {
                 "type": "auth_result",
                 **auth_result
@@ -689,28 +699,23 @@ def handle_client(client_socket, client_address):
             logger.info(f"Auth result sent to {client_address}: {auth_result['status']}")
             
             if auth_result["status"] in ["success", "new_user"]:
-                # Authentication successful
                 clients[client_socket]["authenticated"] = True
                 clients[client_socket]["username"] = username
                 client_usernames[client_socket] = username
                 username_to_socket[username] = client_socket
                 
-                # Update session status
                 update_user_session(username, "online")
                 
                 logger.info(f"User {username} authenticated from {client_address}")
                 
-                # Remove authentication timeout
                 client_socket.settimeout(None)
                 
-                # Send updated peer list to all clients
                 broadcast_peer_list()
                 
-                # Handle messages from this authenticated client
                 handle_authenticated_client(client_socket, username)
             else:
                 logger.warning(f"Authentication failed for {username} from {client_address}: {auth_result['message']}")
-                time.sleep(1)  # Prevent rapid auth attempts
+                time.sleep(1)
                 return
                 
         except json.JSONDecodeError as e:
@@ -761,15 +766,13 @@ def handle_authenticated_client(client_socket, username):
     try:
         while True:
             try:
-                # Set a reasonable timeout for receiving messages
-                client_socket.settimeout(300)  # 5 minutes timeout
+                client_socket.settimeout(300)
                 data = client_socket.recv(BUFFER_SIZE)
                 
                 if not data:
                     logger.info(f"{username} disconnected (no data)")
                     break
                 
-                # Remove timeout for processing
                 client_socket.settimeout(None)
                 
                 try:
@@ -784,7 +787,6 @@ def handle_authenticated_client(client_socket, username):
                     
             except socket.timeout:
                 logger.info(f"Timeout waiting for message from {username}")
-                # Send a ping to check if client is still alive
                 try:
                     ping_message = json.dumps({"type": "ping"})
                     client_socket.sendall(ping_message.encode())
@@ -949,17 +951,6 @@ def health_check():
                 except Exception as e:
                     logger.error(f"❌ Database health check failed: {e}")
             
-            # Check memory usage
-            import psutil
-            try:
-                memory_percent = psutil.virtual_memory().percent
-                if memory_percent > 80:
-                    logger.warning(f"⚠️ High memory usage: {memory_percent}%")
-            except ImportError:
-                pass  # psutil not available
-            except Exception as e:
-                logger.warning(f"Memory check failed: {e}")
-                
         except Exception as e:
             logger.error(f"Health check error: {e}")
 
@@ -989,11 +980,14 @@ def start_server():
         logger.info(f"📦 Buffer size: {BUFFER_SIZE:,} bytes")
         logger.info(f"💾 Database: {'MongoDB Connected' if db_connected else 'In-Memory Fallback'}")
         if db_connected:
-            logger.info(f"🏠 MongoDB: {MONGODB_HOST}:{MONGODB_PORT}/{MONGODB_DB}")
+            if MONGODB_URL:
+                logger.info(f"🏠 MongoDB: Railway MongoDB Service")
+            else:
+                logger.info(f"🏠 MongoDB: {MONGODB_HOST}:{MONGODB_PORT}/{MONGODB_DB}")
         logger.info(f"🕐 Started: {datetime.now()}")
         logger.info("=" * 70)
         logger.info("✅ Server ready for connections...")
-        logger.info("🌍 Desktop clients can connect from anywhere!")
+        logger.info("🚀 Running on Railway - clients can connect globally!")
         logger.info("🌐 HTTP requests will receive a status page")
         logger.info("📊 All activities are logged to database")
         logger.info("-" * 70)
