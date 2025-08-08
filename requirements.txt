@@ -1,18 +1,8 @@
-# Core server requirements
-socket
-threading
-json
-hashlib
-datetime
-logging
-os
-
 # Cryptography for secure messaging
 cryptography>=41.0.0
 
 # MongoDB for persistent data storage
 pymongo>=4.5.0
-dnspython>=2.4.0
 
-# Additional utilities
+# Additional utilities for environment variables
 python-dotenv>=1.0.0
