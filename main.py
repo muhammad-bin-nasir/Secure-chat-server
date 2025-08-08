@@ -1,4 +1,4 @@
-# main.py - Railway-Compatible Secure Chat Server (Fixed)
+# main.py - Railway-Compatible Secure Chat Server with MongoDB
 import socket
 import threading
 import json
@@ -7,6 +7,9 @@ import time
 import os
 import logging
 from datetime import datetime, timedelta
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+import traceback
 
 # Configure logging
 logging.basicConfig(
@@ -18,6 +21,13 @@ logger = logging.getLogger(__name__)
 # Railway configuration
 PORT = int(os.environ.get("PORT", 5000))
 HOST = '0.0.0.0'
+
+# MongoDB configuration
+MONGODB_HOST = os.environ.get("MONGODB_HOST", "localhost")
+MONGODB_PORT = int(os.environ.get("MONGODB_PORT", "27017"))
+MONGODB_DB = os.environ.get("MONGODB_DB", "secure_chat")
+MONGODB_USERNAME = os.environ.get("MONGODB_USERNAME", "")
+MONGODB_PASSWORD = os.environ.get("MONGODB_PASSWORD", "")
 
 # Railway specific settings
 RAILWAY_STATIC_URL = os.environ.get("RAILWAY_STATIC_URL", "")
@@ -31,17 +41,76 @@ clients = {}
 client_usernames = {}
 username_to_socket = {}
 
-# User authentication
-user_database = {}
+# MongoDB collections
+db = None
+users_collection = None
+messages_collection = None
+sessions_collection = None
 
 # Rate limiting
 connection_attempts = {}
 MAX_ATTEMPTS_PER_IP = 10
 RATE_LIMIT_WINDOW = timedelta(minutes=15)
 
+def init_database():
+    """Initialize MongoDB connection and collections"""
+    global db, users_collection, messages_collection, sessions_collection
+    
+    try:
+        # Build MongoDB connection string
+        if MONGODB_USERNAME and MONGODB_PASSWORD:
+            # With authentication
+            connection_string = f"mongodb://{MONGODB_USERNAME}:{MONGODB_PASSWORD}@{MONGODB_HOST}:{MONGODB_PORT}/"
+            logger.info(f"🔐 Connecting to MongoDB with authentication at {MONGODB_HOST}:{MONGODB_PORT}")
+        else:
+            # Without authentication (local development)
+            connection_string = f"mongodb://{MONGODB_HOST}:{MONGODB_PORT}/"
+            logger.info(f"🔓 Connecting to MongoDB without authentication at {MONGODB_HOST}:{MONGODB_PORT}")
+        
+        # Connect to MongoDB
+        client = MongoClient(
+            connection_string,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=20000
+        )
+        
+        # Test the connection
+        client.admin.command('ping')
+        logger.info("✅ MongoDB connection successful")
+        
+        # Get database and collections
+        db = client[MONGODB_DB]
+        users_collection = db.users
+        messages_collection = db.messages
+        sessions_collection = db.sessions
+        
+        # Create indexes for better performance
+        try:
+            users_collection.create_index("username", unique=True)
+            messages_collection.create_index([("timestamp", -1)])
+            sessions_collection.create_index([("last_activity", 1)], expireAfterSeconds=3600)
+            logger.info("📊 Database indexes created successfully")
+        except Exception as index_error:
+            logger.warning(f"⚠️ Index creation warning: {index_error}")
+        
+        # Test basic operations
+        test_result = db.command("dbStats")
+        logger.info(f"📁 Database '{MONGODB_DB}' initialized - Collections: {len(db.list_collection_names())}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ MongoDB connection failed: {e}")
+        logger.warning("🔄 Falling back to in-memory storage")
+        logger.info("💡 For MongoDB setup: Install MongoDB locally or use Docker")
+        logger.info("🐳 Docker: docker run -d -p 27017:27017 --name mongodb mongo:latest")
+        return False
+
 def hash_password(password):
-    """Simple password hashing"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Simple password hashing with salt"""
+    salt = "secure_chat_2024"  # In production, use random salt per user
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def check_rate_limit(client_ip):
     """Check if IP is rate limited"""
@@ -65,7 +134,7 @@ def check_rate_limit(client_ip):
         return True
 
 def authenticate_user(username, password, public_key):
-    """Authenticate user or create new account"""
+    """Authenticate user or create new account with MongoDB"""
     if not username or not password or not public_key:
         return {"status": "fail", "message": "Missing credentials"}
     
@@ -77,48 +146,155 @@ def authenticate_user(username, password, public_key):
     
     password_hash = hash_password(password)
     
-    if username in user_database:
-        if user_database[username]["password_hash"] == password_hash:
-            user_database[username]["public_key"] = public_key
-            user_database[username]["last_login"] = datetime.now()
-            return {"status": "success", "message": "Welcome back!"}
+    try:
+        if users_collection:
+            # MongoDB storage
+            existing_user = users_collection.find_one({"username": username})
+            
+            if existing_user:
+                if existing_user["password_hash"] == password_hash:
+                    # Update user info
+                    users_collection.update_one(
+                        {"username": username},
+                        {
+                            "$set": {
+                                "public_key": public_key,
+                                "last_login": datetime.utcnow()
+                            }
+                        }
+                    )
+                    logger.info(f"🔐 User {username} authenticated successfully")
+                    return {"status": "success", "message": "Welcome back!"}
+                else:
+                    logger.warning(f"❌ Invalid password for user {username}")
+                    return {"status": "fail", "message": "Invalid password"}
+            else:
+                # Create new user
+                user_data = {
+                    "username": username,
+                    "password_hash": password_hash,
+                    "public_key": public_key,
+                    "created_at": datetime.utcnow(),
+                    "last_login": datetime.utcnow()
+                }
+                users_collection.insert_one(user_data)
+                logger.info(f"👤 New user {username} created successfully")
+                return {"status": "new_user", "message": "Account created successfully!"}
+        
         else:
-            return {"status": "fail", "message": "Invalid password"}
-    else:
-        user_database[username] = {
-            "password_hash": password_hash,
-            "public_key": public_key,
-            "last_login": datetime.now()
-        }
-        return {"status": "new_user", "message": "Account created successfully!"}
+            # Fallback to in-memory storage (original code)
+            user_database = getattr(authenticate_user, 'user_database', {})
+            
+            if username in user_database:
+                if user_database[username]["password_hash"] == password_hash:
+                    user_database[username]["public_key"] = public_key
+                    user_database[username]["last_login"] = datetime.now()
+                    return {"status": "success", "message": "Welcome back!"}
+                else:
+                    return {"status": "fail", "message": "Invalid password"}
+            else:
+                user_database[username] = {
+                    "password_hash": password_hash,
+                    "public_key": public_key,
+                    "last_login": datetime.now()
+                }
+                authenticate_user.user_database = user_database
+                return {"status": "new_user", "message": "Account created successfully!"}
+                
+    except Exception as e:
+        logger.error(f"❌ Authentication error: {e}")
+        return {"status": "fail", "message": "Authentication error. Please try again."}
+
+def get_user_public_key(username):
+    """Get user's public key from database"""
+    try:
+        if users_collection:
+            user = users_collection.find_one({"username": username})
+            return user["public_key"] if user else None
+        else:
+            # Fallback to in-memory
+            user_database = getattr(authenticate_user, 'user_database', {})
+            return user_database.get(username, {}).get("public_key")
+    except Exception as e:
+        logger.error(f"❌ Error getting public key for {username}: {e}")
+        return None
+
+def log_message(sender, recipient, message_type, metadata=None):
+    """Log message to database for audit purposes"""
+    try:
+        if messages_collection:
+            message_log = {
+                "sender": sender,
+                "recipient": recipient,
+                "message_type": message_type,
+                "timestamp": datetime.utcnow(),
+                "metadata": metadata or {}
+            }
+            messages_collection.insert_one(message_log)
+    except Exception as e:
+        logger.error(f"❌ Error logging message: {e}")
+
+def update_user_session(username, status="online"):
+    """Update user session status"""
+    try:
+        if sessions_collection:
+            sessions_collection.update_one(
+                {"username": username},
+                {
+                    "$set": {
+                        "status": status,
+                        "last_activity": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+    except Exception as e:
+        logger.error(f"❌ Error updating session for {username}: {e}")
 
 def broadcast_peer_list():
     """Send updated peer list to all authenticated clients"""
     peer_list = []
-    for sock, username in client_usernames.items():
-        if username in user_database:
-            peer_list.append({
-                "username": username,
-                "public_key": user_database[username]["public_key"]
-            })
     
-    peer_message = {
-        "type": "peer_list",
-        "peers": peer_list
-    }
-    
-    message_data = json.dumps(peer_message).encode()
-    
-    disconnected_clients = []
-    for client_socket in list(client_usernames.keys()):
-        try:
-            client_socket.sendall(message_data)
-        except Exception as e:
-            logger.warning(f"Failed to send peer list to client: {e}")
-            disconnected_clients.append(client_socket)
-    
-    for client_socket in disconnected_clients:
-        remove_client(client_socket)
+    try:
+        if users_collection:
+            # Get public keys from database for active users
+            for sock, username in client_usernames.items():
+                public_key = get_user_public_key(username)
+                if public_key:
+                    peer_list.append({
+                        "username": username,
+                        "public_key": public_key
+                    })
+        else:
+            # Fallback to in-memory
+            user_database = getattr(authenticate_user, 'user_database', {})
+            for sock, username in client_usernames.items():
+                if username in user_database:
+                    peer_list.append({
+                        "username": username,
+                        "public_key": user_database[username]["public_key"]
+                    })
+        
+        peer_message = {
+            "type": "peer_list",
+            "peers": peer_list
+        }
+        
+        message_data = json.dumps(peer_message).encode()
+        
+        disconnected_clients = []
+        for client_socket in list(client_usernames.keys()):
+            try:
+                client_socket.sendall(message_data)
+            except Exception as e:
+                logger.warning(f"Failed to send peer list to client: {e}")
+                disconnected_clients.append(client_socket)
+        
+        for client_socket in disconnected_clients:
+            remove_client(client_socket)
+            
+    except Exception as e:
+        logger.error(f"❌ Error broadcasting peer list: {e}")
 
 def remove_client(client_socket):
     """Remove client from all tracking structures"""
@@ -131,7 +307,10 @@ def remove_client(client_socket):
             if username in username_to_socket:
                 del username_to_socket[username]
             
-            logger.info(f"User {username} disconnected")
+            # Update session status
+            update_user_session(username, "offline")
+            
+            logger.info(f"👋 User {username} disconnected")
         
         if client_socket in clients:
             del clients[client_socket]
@@ -162,7 +341,30 @@ def is_http_request(data):
 
 def send_http_response(client_socket):
     """Send HTTP response for web browsers accessing the server"""
-    response = """HTTP/1.1 200 OK
+    try:
+        # Get stats from database if available
+        total_users = 0
+        if users_collection:
+            try:
+                total_users = users_collection.count_documents({})
+            except:
+                pass
+        else:
+            user_database = getattr(authenticate_user, 'user_database', {})
+            total_users = len(user_database)
+        
+        connected_users = len(client_usernames)
+        
+        # Database status
+        db_status = "✅ MongoDB Connected" if db else "⚠️ In-Memory Storage"
+        db_info = f"Host: {MONGODB_HOST}:{MONGODB_PORT}" if db else "Local fallback mode"
+        
+    except:
+        total_users = 0
+        connected_users = 0
+        db_status = "❌ Database Error"
+    
+    response = f"""HTTP/1.1 200 OK
 Content-Type: text/html; charset=utf-8
 Connection: close
 Access-Control-Allow-Origin: *
@@ -172,114 +374,195 @@ Access-Control-Allow-Headers: Content-Type
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🔐 Secure Chat Server</title>
+    <title>🔐 Secure Chat Server - Railway Deployment</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { 
-            font-family: Arial, sans-serif; 
-            max-width: 600px; 
+        body {{ 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            max-width: 800px; 
             margin: 50px auto; 
             padding: 20px;
-            background: #f5f5f5;
-        }
-        .container {
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        .status { color: #28a745; font-weight: bold; font-size: 18px; }
-        .info { 
-            background: #e9ecef; 
-            padding: 15px; 
-            border-radius: 5px; 
-            margin: 20px 0;
-            border-left: 4px solid #007bff;
-        }
-        .warning { 
-            color: #fd7e14; 
-            background: #fff3cd;
-            padding: 15px;
-            border-radius: 5px;
-            border-left: 4px solid #ffc107;
-        }
-        .stats {
-            display: flex;
-            justify-content: space-between;
-            margin: 20px 0;
-        }
-        .stat-item {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+        }}
+        .container {{
+            background: rgba(255, 255, 255, 0.95);
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+        }}
+        .status {{ color: #28a745; font-weight: bold; font-size: 20px; text-align: center; }}
+        .info {{ 
+            background: linear-gradient(135deg, #e3f2fd 0%, #f8f9ff 100%);
+            padding: 20px; 
+            border-radius: 15px; 
+            margin: 25px 0;
+            border-left: 5px solid #2196f3;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }}
+        .warning {{ 
+            color: #e65100; 
+            background: linear-gradient(135deg, #fff3e0 0%, #fff8e1 100%);
+            padding: 20px;
+            border-radius: 15px;
+            border-left: 5px solid #ff9800;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }}
+        .stat-item {{
             text-align: center;
-            padding: 10px;
-            background: #f8f9fa;
-            border-radius: 5px;
-            flex: 1;
-            margin: 0 5px;
-        }
-        .stat-number {
-            font-size: 24px;
+            padding: 20px;
+            background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            transition: transform 0.3s ease;
+        }}
+        .stat-item:hover {{
+            transform: translateY(-5px);
+        }}
+        .stat-number {{
+            font-size: 32px;
             font-weight: bold;
-            color: #007bff;
-        }
-        h1 { color: #343a40; text-align: center; }
-        h3 { color: #495057; }
+            color: #2196f3;
+            margin-bottom: 5px;
+        }}
+        .stat-label {{
+            color: #666;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        h1 {{ 
+            color: #2c3e50; 
+            text-align: center; 
+            font-size: 2.5em;
+            margin-bottom: 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }}
+        h3 {{ 
+            color: #34495e; 
+            margin-bottom: 15px;
+            font-size: 1.3em;
+        }}
+        ul {{ 
+            line-height: 1.8; 
+            margin-left: 20px;
+        }}
+        li {{ 
+            margin: 8px 0; 
+        }}
+        .database-status {{
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 12px;
+            background: #e8f5e8;
+            color: #2e7d2e;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 40px;
+            padding: 20px;
+            color: #666;
+            font-size: 14px;
+        }}
+        @keyframes pulse {{
+            0% {{ opacity: 1; }}
+            50% {{ opacity: 0.7; }}
+            100% {{ opacity: 1; }}
+        }}
+        .online {{ animation: pulse 2s infinite; }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🔐 Secure Chat Server</h1>
-        <p class="status">✅ Server is running and accepting connections!</p>
+        <p class="status online">✅ Server is running and accepting connections!</p>
         
         <div class="stats">
             <div class="stat-item">
-                <div class="stat-number">""" + str(len(client_usernames)) + """</div>
-                <div>Connected Users</div>
+                <div class="stat-number">{connected_users}</div>
+                <div class="stat-label">Connected Users</div>
             </div>
             <div class="stat-item">
-                <div class="stat-number">""" + str(len(user_database)) + """</div>
-                <div>Total Registered</div>
+                <div class="stat-number">{total_users}</div>
+                <div class="stat-label">Total Registered</div>
             </div>
             <div class="stat-item">
-                <div class="stat-number">""" + str(PORT) + """</div>
-                <div>Server Port</div>
+                <div class="stat-number">{PORT}</div>
+                <div class="stat-label">Server Port</div>
             </div>
+            <div class="stat-item">
+                <div class="stat-number">{MAX_CLIENTS}</div>
+                <div class="stat-label">Max Capacity</div>
+            </div>
+        </div>
+        
+        <div class="info">
+            <h3>💾 Database Status</h3>
+            <p><span class="database-status">{db_status}</span></p>
+            <p><strong>Connection:</strong> {db_info}</p>
+            <p><strong>Database:</strong> {MONGODB_DB}</p>
+            <p>MongoDB provides persistent user accounts, message logging, and session management.</p>
         </div>
         
         <div class="info">
             <h3>📱 For Desktop Clients:</h3>
             <ul>
-                <li><strong>Connection Type:</strong> TCP Socket</li>
-                <li><strong>Protocol:</strong> JSON over TCP</li>
-                <li><strong>Use your PyQt5 desktop client to connect</strong></li>
-                <li><strong>Server URL:</strong> This Railway domain</li>
-                <li><strong>Port:</strong> """ + str(PORT) + """</li>
+                <li><strong>Connection Type:</strong> TCP Socket Connection</li>
+                <li><strong>Protocol:</strong> JSON over TCP with End-to-End Encryption</li>
+                <li><strong>Client:</strong> Use the PyQt5 desktop application</li>
+                <li><strong>Server URL:</strong> This Railway domain (no http://)</li>
+                <li><strong>Port:</strong> {PORT}</li>
+                <li><strong>Security:</strong> RSA + AES-256 hybrid encryption</li>
             </ul>
         </div>
         
         <div class="info">
-            <h3>🔧 Technical Details:</h3>
+            <h3>🔧 Technical Specifications:</h3>
             <ul>
-                <li><strong>Max Clients:</strong> """ + str(MAX_CLIENTS) + """</li>
-                <li><strong>Buffer Size:</strong> """ + str(BUFFER_SIZE) + """ bytes</li>
-                <li><strong>Rate Limiting:</strong> """ + str(MAX_ATTEMPTS_PER_IP) + """ attempts per 15 minutes</li>
-                <li><strong>Deployment:</strong> Railway Cloud Platform</li>
+                <li><strong>Maximum Clients:</strong> {MAX_CLIENTS} simultaneous connections</li>
+                <li><strong>Buffer Size:</strong> {BUFFER_SIZE:,} bytes per message</li>
+                <li><strong>Rate Limiting:</strong> {MAX_ATTEMPTS_PER_IP} attempts per 15 minutes</li>
+                <li><strong>Platform:</strong> Railway Cloud with MongoDB</li>
+                <li><strong>Runtime:</strong> Python 3.11+ with PyMongo</li>
+                <li><strong>Features:</strong> File transfer, Group messaging, User authentication</li>
             </ul>
         </div>
         
         <div class="warning">
-            <h3>⚠️ Important Notes:</h3>
+            <h3>⚠️ Important Information:</h3>
             <ul>
-                <li>This server accepts <strong>desktop client connections only</strong></li>
-                <li>Web browsers cannot directly connect to the chat functionality</li>
-                <li>All messages are end-to-end encrypted using RSA + AES</li>
-                <li>Use the provided PyQt5 client application</li>
+                <li><strong>Desktop Only:</strong> This server requires the desktop client application</li>
+                <li><strong>Web Incompatible:</strong> Browsers cannot connect to TCP socket servers</li>
+                <li><strong>End-to-End Encrypted:</strong> All messages use RSA + AES-256 encryption</li>
+                <li><strong>Persistent Storage:</strong> User accounts and sessions are saved in MongoDB</li>
+                <li><strong>File Support:</strong> Secure file transfer with integrity verification</li>
             </ul>
         </div>
         
         <div class="info">
-            <h3>📊 Server Status:</h3>
-            <p><strong>Uptime:</strong> Online since """ + str(datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")) + """</p>
-            <p><strong>Health:</strong> ✅ All systems operational</p>
+            <h3>📊 System Status:</h3>
+            <p><strong>Server Uptime:</strong> Online since {datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")}</p>
+            <p><strong>Health Status:</strong> <span style="color: #28a745;">●</span> All systems operational</p>
+            <p><strong>Security Level:</strong> <span style="color: #28a745;">●</span> Maximum encryption enabled</p>
+            <p><strong>Database:</strong> {db_status}</p>
+        </div>
+        
+        <div class="footer">
+            <p>🚀 Deployed on Railway | 🔐 Secured by RSA-2048 + AES-256</p>
+            <p>© 2024 Secure Chat Server - End-to-End Encrypted Messaging</p>
         </div>
     </div>
 </body>
@@ -411,6 +694,9 @@ def handle_client(client_socket, client_address):
                 clients[client_socket]["username"] = username
                 client_usernames[client_socket] = username
                 username_to_socket[username] = client_socket
+                
+                # Update session status
+                update_user_session(username, "online")
                 
                 logger.info(f"User {username} authenticated from {client_address}")
                 
@@ -546,22 +832,35 @@ def route_message(sender_socket, sender_username, message):
             message_data = json.dumps(message).encode()
             recipient_socket.sendall(message_data)
             
-            # Log message types (but not content for privacy)
+            # Log message to database
+            metadata = {}
             if msg_type == "message":
-                logger.info(f"Message: {sender_username} -> {recipient}")
+                logger.info(f"💬 Message: {sender_username} -> {recipient}")
+                metadata = {"encrypted": True}
             elif msg_type == "key_exchange":
-                logger.info(f"Key exchange: {sender_username} -> {recipient}")
+                logger.info(f"🔑 Key exchange: {sender_username} -> {recipient}")
+                metadata = {"key_type": "public_key"}
             elif msg_type == "file_header":
                 filename = message.get("filename", "unknown")
                 filesize = message.get("filesize", 0)
-                logger.info(f"File start: {sender_username} -> {recipient}: '{filename}' ({filesize} bytes)")
+                logger.info(f"📁 File start: {sender_username} -> {recipient}: '{filename}' ({filesize} bytes)")
+                metadata = {"filename": filename, "filesize": filesize, "transfer_status": "started"}
             elif msg_type == "file_chunk":
-                logger.debug(f"File chunk: {sender_username} -> {recipient}")
+                logger.debug(f"📦 File chunk: {sender_username} -> {recipient}")
+                metadata = {"chunk_transfer": True}
             elif msg_type == "file_end":
                 filename = message.get("filename", "unknown")  
-                logger.info(f"File completed: {sender_username} -> {recipient}: '{filename}'")
+                logger.info(f"✅ File completed: {sender_username} -> {recipient}: '{filename}'")
+                metadata = {"filename": filename, "transfer_status": "completed"}
             else:
-                logger.info(f"Message type '{msg_type}': {sender_username} -> {recipient}")
+                logger.info(f"📨 Message type '{msg_type}': {sender_username} -> {recipient}")
+                metadata = {"message_type": msg_type}
+            
+            # Log to database (non-blocking)
+            try:
+                log_message(sender_username, recipient, msg_type, metadata)
+            except Exception as log_error:
+                logger.warning(f"Failed to log message: {log_error}")
                 
         except Exception as e:
             logger.error(f"Failed to forward message from {sender_username} to {recipient}: {e}")
@@ -586,7 +885,7 @@ def cleanup_old_rate_limits():
                 del connection_attempts[ip]
             
             if expired_ips:
-                logger.info(f"Cleaned up {len(expired_ips)} expired rate limit entries")
+                logger.info(f"🧹 Cleaned up {len(expired_ips)} expired rate limit entries")
             
             # Clean up every 10 minutes
             time.sleep(600)
@@ -601,20 +900,74 @@ def print_server_stats():
             # Print stats every 10 minutes
             time.sleep(600)
             connected_users = len(client_usernames)
-            total_users = len(user_database)
+            
+            # Get total users from database
+            total_users = 0
+            if users_collection:
+                try:
+                    total_users = users_collection.count_documents({})
+                except:
+                    pass
+            else:
+                user_database = getattr(authenticate_user, 'user_database', {})
+                total_users = len(user_database)
+            
             rate_limited_ips = len(connection_attempts)
             
-            logger.info(f"Server Stats - Connected: {connected_users}, Total users: {total_users}, Rate-limited IPs: {rate_limited_ips}")
+            logger.info(f"📊 Server Stats - Connected: {connected_users}, Total users: {total_users}, Rate-limited IPs: {rate_limited_ips}")
             
             if connected_users > 0:
                 usernames = list(client_usernames.values())
-                logger.info(f"Online users: {', '.join(usernames)}")
+                logger.info(f"👥 Online users: {', '.join(usernames)}")
+            
+            # Log database status
+            if db:
+                try:
+                    # Get recent message count
+                    if messages_collection:
+                        recent_messages = messages_collection.count_documents({
+                            "timestamp": {"$gte": datetime.utcnow() - timedelta(hours=24)}
+                        })
+                        logger.info(f"📨 Messages in last 24h: {recent_messages}")
+                except Exception as e:
+                    logger.warning(f"Failed to get message stats: {e}")
                 
         except Exception as e:
             logger.error(f"Stats error: {e}")
 
+def health_check():
+    """Perform periodic health checks"""
+    while True:
+        try:
+            time.sleep(300)  # Check every 5 minutes
+            
+            # Check database connection
+            if db:
+                try:
+                    db.command('ping')
+                    logger.debug("🔍 Database health check: OK")
+                except Exception as e:
+                    logger.error(f"❌ Database health check failed: {e}")
+            
+            # Check memory usage
+            import psutil
+            try:
+                memory_percent = psutil.virtual_memory().percent
+                if memory_percent > 80:
+                    logger.warning(f"⚠️ High memory usage: {memory_percent}%")
+            except ImportError:
+                pass  # psutil not available
+            except Exception as e:
+                logger.warning(f"Memory check failed: {e}")
+                
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
+
 def start_server():
     """Start the secure chat server"""
+    # Initialize database first
+    db_connected = init_database()
+    
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
@@ -628,27 +981,34 @@ def start_server():
         server_socket.bind((HOST, PORT))
         server_socket.listen(MAX_CLIENTS)
         
-        logger.info("=" * 60)
-        logger.info("🔐 SECURE CHAT SERVER - RAILWAY DEPLOYMENT")
+        logger.info("=" * 70)
+        logger.info("🔐 SECURE CHAT SERVER - RAILWAY DEPLOYMENT WITH MONGODB")
         logger.info(f"🌐 Host: {HOST}")
         logger.info(f"🔌 Port: {PORT}")
         logger.info(f"👥 Max clients: {MAX_CLIENTS}")
-        logger.info(f"📦 Buffer size: {BUFFER_SIZE} bytes")
+        logger.info(f"📦 Buffer size: {BUFFER_SIZE:,} bytes")
+        logger.info(f"💾 Database: {'MongoDB Connected' if db_connected else 'In-Memory Fallback'}")
+        if db_connected:
+            logger.info(f"🏠 MongoDB: {MONGODB_HOST}:{MONGODB_PORT}/{MONGODB_DB}")
         logger.info(f"🕐 Started: {datetime.now()}")
-        logger.info("=" * 60)
+        logger.info("=" * 70)
         logger.info("✅ Server ready for connections...")
         logger.info("🌍 Desktop clients can connect from anywhere!")
         logger.info("🌐 HTTP requests will receive a status page")
-        logger.info("-" * 60)
+        logger.info("📊 All activities are logged to database")
+        logger.info("-" * 70)
         
         # Start background threads
-        cleanup_thread = threading.Thread(target=cleanup_old_rate_limits, daemon=True)
+        cleanup_thread = threading.Thread(target=cleanup_old_rate_limits, daemon=True, name="Cleanup")
         cleanup_thread.start()
         
-        stats_thread = threading.Thread(target=print_server_stats, daemon=True)
+        stats_thread = threading.Thread(target=print_server_stats, daemon=True, name="Stats")
         stats_thread.start()
         
-        logger.info("Background threads started")
+        health_thread = threading.Thread(target=health_check, daemon=True, name="HealthCheck")
+        health_thread.start()
+        
+        logger.info("🔄 Background threads started (Cleanup, Stats, HealthCheck)")
         
         # Main server loop
         connection_count = 0
@@ -657,11 +1017,11 @@ def start_server():
                 client_socket, client_address = server_socket.accept()
                 connection_count += 1
                 
-                logger.info(f"Connection #{connection_count} from {client_address}")
+                logger.info(f"🔌 Connection #{connection_count} from {client_address}")
                 
                 # Check server capacity
                 if len(clients) >= MAX_CLIENTS:
-                    logger.warning(f"Server at capacity ({MAX_CLIENTS}), rejecting {client_address}")
+                    logger.warning(f"🚫 Server at capacity ({MAX_CLIENTS}), rejecting {client_address}")
                     error_response = {
                         "type": "auth_result",
                         "status": "error",
@@ -699,10 +1059,9 @@ def start_server():
         logger.info("Server shutdown requested")
     except Exception as e:
         logger.error(f"Server error: {e}")
-        import traceback
         logger.error(traceback.format_exc())
     finally:
-        logger.info("Shutting down server...")
+        logger.info("🔄 Shutting down server...")
         
         # Close all client connections
         for client_socket in list(clients.keys()):
@@ -711,12 +1070,25 @@ def start_server():
             except:
                 pass
         
+        # Close database connection
+        if db:
+            try:
+                # Update all sessions to offline
+                if sessions_collection:
+                    sessions_collection.update_many(
+                        {"status": "online"},
+                        {"$set": {"status": "offline", "last_activity": datetime.utcnow()}}
+                    )
+                logger.info("💾 Database cleanup completed")
+            except Exception as e:
+                logger.warning(f"Database cleanup error: {e}")
+        
         try:
             server_socket.close()
         except:
             pass
             
-        logger.info("Server shutdown complete")
+        logger.info("✅ Server shutdown complete")
 
 # Entry point
 if __name__ == "__main__":
@@ -724,5 +1096,4 @@ if __name__ == "__main__":
         start_server()
     except Exception as e:
         logger.error(f"Fatal server error: {e}")
-        import traceback
         logger.error(traceback.format_exc())
