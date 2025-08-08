@@ -1,0 +1,20 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[[services]]
+serviceName = "secure-chat-server"
+
+[services.variables]
+# Environment variables for Railway deployment
+PYTHONPATH = "/app"
+PYTHONUNBUFFERED = "1"
+
+# Optional: Override default settings
+# MAX_CLIENTS = "50"
+# BUFFER_SIZE = "16384"
