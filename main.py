@@ -28,7 +28,7 @@ PORT = int(os.environ.get("PORT", 5000))
 HOST = '0.0.0.0'  # Railway requires 0.0.0.0
 
 # MongoDB configuration - UPDATED FOR RAILWAY MONGODB
-MONGODB_URL = os.environ.get("MONGODB_URL")  # Railway MongoDB addon provides this
+MONGODB_URL = os.environ.get("MONGO_URL")  # Railway MongoDB addon provides this
 MONGODB_HOST = os.environ.get("MONGODB_HOST", "localhost")
 MONGODB_PORT = int(os.environ.get("MONGODB_PORT", "27017"))
 MONGODB_DB = os.environ.get("MONGODB_DB", "secure_chat")
@@ -1091,3 +1091,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal server error: {e}")
         logger.error(traceback.format_exc())
+
