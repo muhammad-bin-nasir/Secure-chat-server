@@ -165,7 +165,7 @@ def authenticate_user(username, password, public_key):
     logger.debug(f"   Username length: {len(username) if username else 0}")
     logger.debug(f"   Password length: {len(password) if password else 0}")
     logger.debug(f"   Public key length: {len(public_key) if public_key else 0}")
-    logger.debug(f"   MongoDB available: {bool(users_collection)}")
+    logger.debug(f"   MongoDB available: {users_collection is not None}")
     
     # Basic validation
     if not username or not password or not public_key:
