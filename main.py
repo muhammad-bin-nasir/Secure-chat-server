@@ -1,4 +1,4 @@
-# main.py - Railway-Compatible Secure Chat Server with MongoDB
+# main.py - Railway-Compatible Secure Chat Server with MongoDB and Enhanced Debugging
 import socket
 import threading
 import json
@@ -12,9 +12,9 @@ from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import traceback
 import sys
 
-# Configure logging
+# Configure logging with more detail
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG for more detail
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -61,6 +61,14 @@ RATE_LIMIT_WINDOW = timedelta(minutes=15)
 def init_database():
     """Initialize MongoDB connection and collections - UPDATED FOR RAILWAY"""
     global db, users_collection, messages_collection, sessions_collection
+    
+    logger.info("🔄 Starting database initialization...")
+    logger.info(f"MONGODB_URL exists: {bool(MONGODB_URL)}")
+    logger.info(f"MONGODB_HOST: {MONGODB_HOST}")
+    logger.info(f"MONGODB_PORT: {MONGODB_PORT}")
+    logger.info(f"MONGODB_DB: {MONGODB_DB}")
+    logger.info(f"MONGODB_USERNAME exists: {bool(MONGODB_USERNAME)}")
+    logger.info(f"MONGODB_PASSWORD exists: {bool(MONGODB_PASSWORD)}")
     
     try:
         # Try Railway MongoDB URL first (preferred)
@@ -120,6 +128,7 @@ def init_database():
         
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
+        logger.error(f"Full error: {traceback.format_exc()}")
         logger.warning("🔄 Falling back to in-memory storage")
         logger.info("💡 For MongoDB setup on Railway: Add MongoDB addon or set MONGODB_URL")
         return False
@@ -151,76 +160,133 @@ def check_rate_limit(client_ip):
         return True
 
 def authenticate_user(username, password, public_key):
-    """Authenticate user or create new account with MongoDB"""
-    if not username or not password or not public_key:
-        return {"status": "fail", "message": "Missing credentials"}
+    """Authenticate user or create new account with MongoDB - ENHANCED DEBUGGING"""
+    logger.debug(f"🔍 Starting authentication for user: {username}")
+    logger.debug(f"   Username length: {len(username) if username else 0}")
+    logger.debug(f"   Password length: {len(password) if password else 0}")
+    logger.debug(f"   Public key length: {len(public_key) if public_key else 0}")
+    logger.debug(f"   MongoDB available: {bool(users_collection)}")
     
-    if len(username) > 50 or not username.replace('_', '').replace('-', '').isalnum():
+    # Basic validation
+    if not username or not password or not public_key:
+        missing = []
+        if not username: missing.append("username")
+        if not password: missing.append("password") 
+        if not public_key: missing.append("public_key")
+        logger.warning(f"❌ Missing credentials: {missing}")
+        return {"status": "fail", "message": f"Missing credentials: {', '.join(missing)}"}
+    
+    # Username validation
+    if len(username) > 50:
+        logger.warning(f"❌ Username too long: {len(username)} chars")
+        return {"status": "fail", "message": "Username too long (max 50 characters)"}
+        
+    if not username.replace('_', '').replace('-', '').isalnum():
+        logger.warning(f"❌ Invalid username format: {username}")
         return {"status": "fail", "message": "Invalid username format"}
     
+    # Password validation
     if len(password) > 128:
-        return {"status": "fail", "message": "Password too long"}
+        logger.warning(f"❌ Password too long: {len(password)} chars")
+        return {"status": "fail", "message": "Password too long (max 128 characters)"}
     
-    password_hash = hash_password(password)
+    logger.debug("✅ Basic validation passed")
+    
+    # Hash password
+    try:
+        password_hash = hash_password(password)
+        logger.debug(f"✅ Password hashed successfully")
+    except Exception as e:
+        logger.error(f"❌ Password hashing failed: {e}")
+        return {"status": "fail", "message": "Password processing error"}
     
     try:
         if users_collection:
-            # MongoDB storage
-            existing_user = users_collection.find_one({"username": username})
-            
-            if existing_user:
-                if existing_user["password_hash"] == password_hash:
-                    # Update user info
-                    users_collection.update_one(
-                        {"username": username},
-                        {
-                            "$set": {
-                                "public_key": public_key,
-                                "last_login": datetime.utcnow()
-                            }
-                        }
-                    )
-                    logger.info(f"🔐 User {username} authenticated successfully")
-                    return {"status": "success", "message": "Welcome back!"}
+            logger.debug("🔍 Using MongoDB storage")
+            try:
+                # MongoDB storage
+                existing_user = users_collection.find_one({"username": username})
+                logger.debug(f"✅ Database query completed, user exists: {bool(existing_user)}")
+                
+                if existing_user:
+                    logger.debug("🔍 Existing user found, checking password")
+                    if existing_user["password_hash"] == password_hash:
+                        logger.debug("✅ Password matches")
+                        # Update user info
+                        try:
+                            users_collection.update_one(
+                                {"username": username},
+                                {
+                                    "$set": {
+                                        "public_key": public_key,
+                                        "last_login": datetime.utcnow()
+                                    }
+                                }
+                            )
+                            logger.debug("✅ User info updated")
+                            logger.info(f"🔐 User {username} authenticated successfully")
+                            return {"status": "success", "message": "Welcome back!"}
+                        except Exception as update_error:
+                            logger.error(f"❌ Failed to update user: {update_error}")
+                            return {"status": "fail", "message": "Database update error"}
+                    else:
+                        logger.warning(f"❌ Invalid password for user {username}")
+                        return {"status": "fail", "message": "Invalid password"}
                 else:
-                    logger.warning(f"❌ Invalid password for user {username}")
-                    return {"status": "fail", "message": "Invalid password"}
-            else:
-                # Create new user
-                user_data = {
-                    "username": username,
-                    "password_hash": password_hash,
-                    "public_key": public_key,
-                    "created_at": datetime.utcnow(),
-                    "last_login": datetime.utcnow()
-                }
-                users_collection.insert_one(user_data)
-                logger.info(f"👤 New user {username} created successfully")
-                return {"status": "new_user", "message": "Account created successfully!"}
+                    logger.debug("🆕 Creating new user")
+                    # Create new user
+                    try:
+                        user_data = {
+                            "username": username,
+                            "password_hash": password_hash,
+                            "public_key": public_key,
+                            "created_at": datetime.utcnow(),
+                            "last_login": datetime.utcnow()
+                        }
+                        result = users_collection.insert_one(user_data)
+                        logger.debug(f"✅ User created with ID: {result.inserted_id}")
+                        logger.info(f"👤 New user {username} created successfully")
+                        return {"status": "new_user", "message": "Account created successfully!"}
+                    except Exception as create_error:
+                        logger.error(f"❌ Failed to create user: {create_error}")
+                        return {"status": "fail", "message": "Account creation error"}
+                        
+            except Exception as db_error:
+                logger.error(f"❌ Database operation failed: {db_error}")
+                logger.error(f"Full database error: {traceback.format_exc()}")
+                return {"status": "fail", "message": "Database error"}
         
         else:
+            logger.debug("💾 Using in-memory storage")
             # Fallback to in-memory storage (original code)
             user_database = getattr(authenticate_user, 'user_database', {})
+            logger.debug(f"In-memory database has {len(user_database)} users")
             
             if username in user_database:
+                logger.debug("🔍 Existing user found in memory")
                 if user_database[username]["password_hash"] == password_hash:
                     user_database[username]["public_key"] = public_key
                     user_database[username]["last_login"] = datetime.now()
+                    logger.info(f"🔐 User {username} authenticated successfully (in-memory)")
                     return {"status": "success", "message": "Welcome back!"}
                 else:
+                    logger.warning(f"❌ Invalid password for user {username} (in-memory)")
                     return {"status": "fail", "message": "Invalid password"}
             else:
+                logger.debug("🆕 Creating new user in memory")
                 user_database[username] = {
                     "password_hash": password_hash,
                     "public_key": public_key,
                     "last_login": datetime.now()
                 }
                 authenticate_user.user_database = user_database
+                logger.info(f"👤 New user {username} created successfully (in-memory)")
                 return {"status": "new_user", "message": "Account created successfully!"}
                 
     except Exception as e:
-        logger.error(f"❌ Authentication error: {e}")
-        return {"status": "fail", "message": "Authentication error. Please try again."}
+        logger.error(f"❌ Authentication error for {username}: {str(e)}")
+        logger.error(f"Full authentication error: {traceback.format_exc()}")
+        return {"status": "fail", "message": f"Authentication error: {str(e)}"}
 
 def get_user_public_key(username):
     """Get user's public key from database"""
@@ -638,6 +704,7 @@ def handle_client(client_socket, client_address):
             return
         
         logger.info(f"Received {len(initial_data)} bytes from {client_address}")
+        logger.debug(f"Raw data preview: {initial_data[:200]}...")
         
         if is_http_request(initial_data):
             logger.info(f"HTTP request detected from {client_address}, sending web response")
@@ -646,6 +713,7 @@ def handle_client(client_socket, client_address):
         
         try:
             data_str = initial_data.decode('utf-8')
+            logger.debug(f"Decoded data: {data_str[:200]}...")
             
             brace_count = 0
             json_end = -1
@@ -665,6 +733,7 @@ def handle_client(client_socket, client_address):
                 auth_payload = json.loads(data_str)
             
             logger.info(f"Parsed auth payload from {client_address}: {list(auth_payload.keys())}")
+            logger.debug(f"Auth payload contents: {auth_payload}")
             
             required_fields = ["username", "auth", "public_key"]
             missing_fields = [field for field in required_fields if field not in auth_payload]
@@ -684,6 +753,9 @@ def handle_client(client_socket, client_address):
             public_key = auth_payload.get("public_key", "")
             
             logger.info(f"Authentication attempt from {client_address} for user: {username}")
+            logger.debug(f"   Username: '{username}' (len: {len(username)})")
+            logger.debug(f"   Password: {len(password)} chars")
+            logger.debug(f"   Public key: {len(public_key)} chars")
             
             auth_result = authenticate_user(username, password, public_key)
             
@@ -691,6 +763,8 @@ def handle_client(client_socket, client_address):
                 "type": "auth_result",
                 **auth_result
             }
+            
+            logger.debug(f"Sending auth response: {response}")
             
             if not send_safe_json_response(client_socket, response):
                 logger.error(f"Failed to send auth response to {client_address}")
@@ -742,6 +816,7 @@ def handle_client(client_socket, client_address):
             
         except Exception as e:
             logger.error(f"Auth processing error for {client_address}: {e}")
+            logger.error(f"Full auth processing error: {traceback.format_exc()}")
             error_response = {
                 "type": "auth_result",
                 "status": "error",
@@ -756,6 +831,7 @@ def handle_client(client_socket, client_address):
         logger.info(f"Connection reset by {client_address}")
     except Exception as e:
         logger.error(f"Client handling error for {client_address}: {e}")
+        logger.error(f"Full client handling error: {traceback.format_exc()}")
     finally:
         remove_client(client_socket)
 
@@ -973,7 +1049,7 @@ def start_server():
         server_socket.listen(MAX_CLIENTS)
         
         logger.info("=" * 70)
-        logger.info("🔐 SECURE CHAT SERVER - RAILWAY DEPLOYMENT WITH MONGODB")
+        logger.info("🔐 SECURE CHAT SERVER - RAILWAY DEPLOYMENT WITH ENHANCED DEBUGGING")
         logger.info(f"🌐 Host: {HOST}")
         logger.info(f"🔌 Port: {PORT}")
         logger.info(f"👥 Max clients: {MAX_CLIENTS}")
@@ -990,6 +1066,7 @@ def start_server():
         logger.info("🚀 Running on Railway - clients can connect globally!")
         logger.info("🌐 HTTP requests will receive a status page")
         logger.info("📊 All activities are logged to database")
+        logger.info("🐛 Enhanced debugging enabled")
         logger.info("-" * 70)
         
         # Start background threads
