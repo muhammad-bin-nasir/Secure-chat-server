@@ -201,7 +201,7 @@ def authenticate_user(username, password, public_key):
         return {"status": "fail", "message": "Password processing error"}
     
     try:
-        if users_collection:
+        if users_collection is not None:
             logger.debug("🔍 Using MongoDB storage")
             try:
                 # MongoDB storage
@@ -291,7 +291,7 @@ def authenticate_user(username, password, public_key):
 def get_user_public_key(username):
     """Get user's public key from database"""
     try:
-        if users_collection:
+        if users_collection is not None:
             user = users_collection.find_one({"username": username})
             return user["public_key"] if user else None
         else:
@@ -305,7 +305,7 @@ def get_user_public_key(username):
 def log_message(sender, recipient, message_type, metadata=None):
     """Log message to database for audit purposes"""
     try:
-        if messages_collection:
+        if messages_collection is not None:
             message_log = {
                 "sender": sender,
                 "recipient": recipient,
@@ -320,7 +320,7 @@ def log_message(sender, recipient, message_type, metadata=None):
 def update_user_session(username, status="online"):
     """Update user session status"""
     try:
-        if sessions_collection:
+        if sessions_collection is not None:
             sessions_collection.update_one(
                 {"username": username},
                 {
@@ -339,7 +339,7 @@ def broadcast_peer_list():
     peer_list = []
     
     try:
-        if users_collection:
+        if users_collection is not None:
             # Get public keys from database for active users
             for sock, username in client_usernames.items():
                 public_key = get_user_public_key(username)
@@ -427,7 +427,7 @@ def send_http_response(client_socket):
     try:
         # Get stats from database if available
         total_users = 0
-        if users_collection:
+        if users_collection is not None:
             try:
                 total_users = users_collection.count_documents({})
             except:
@@ -981,7 +981,7 @@ def print_server_stats():
             
             # Get total users from database
             total_users = 0
-            if users_collection:
+            if users_collection is not None:
                 try:
                     total_users = users_collection.count_documents({})
                 except:
@@ -1002,7 +1002,7 @@ def print_server_stats():
             if db:
                 try:
                     # Get recent message count
-                    if messages_collection:
+                    if messages_collection is not None:
                         recent_messages = messages_collection.count_documents({
                             "timestamp": {"$gte": datetime.utcnow() - timedelta(hours=24)}
                         })
@@ -1145,7 +1145,7 @@ def start_server():
         if db:
             try:
                 # Update all sessions to offline
-                if sessions_collection:
+                if sessions_collection is not None:
                     sessions_collection.update_many(
                         {"status": "online"},
                         {"$set": {"status": "offline", "last_activity": datetime.utcnow()}}
