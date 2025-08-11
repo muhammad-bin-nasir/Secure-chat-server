@@ -11,6 +11,11 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import traceback
 import sys
+from fastapi import FastAPI, WebSocket
+import json
+
+app = FastAPI()
+
 
 # Configure logging with more detail
 logging.basicConfig(
@@ -1161,6 +1166,21 @@ def start_server():
             
         logger.info("✅ Server shutdown complete")
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            # Use your existing TCP message handling logic
+            response = handle_client_message(message)  # Your existing function
+            
+            await websocket.send_text(json.dumps(response))
+    except Exception as e:
+        await websocket.close()
+
 # Entry point
 if __name__ == "__main__":
     try:
@@ -1168,3 +1188,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal server error: {e}")
         logger.error(traceback.format_exc())
+
