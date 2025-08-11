@@ -1,624 +1,1093 @@
-#!/usr/bin/env python3
-"""
-Simple Chat Client for Railway Server - No Encryption Version
-Compatible with the Railway secure chat server for testing purposes
-"""
-
-import sys
-import json
+# main.py - Railway-Compatible Secure Chat Server with MongoDB
 import socket
 import threading
+import json
+import hashlib
 import time
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
-    QLineEdit, QPushButton, QLabel, QListWidget, QMessageBox, 
-    QInputDialog, QSplitter, QTabWidget, QProgressBar, QFrame
+import os
+import logging
+from datetime import datetime, timedelta
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+import traceback
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(sys.stderr)
+    ]
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
-from PyQt5.QtGui import QFont, QPalette, QColor
+logger = logging.getLogger(__name__)
 
-class MessageSignal(QObject):
-    """Signal handler for thread-safe GUI updates"""
-    message_received = pyqtSignal(str, str)  # sender, message
-    peer_list_updated = pyqtSignal(list)     # list of peers
-    system_message = pyqtSignal(str)         # system messages
-    status_changed = pyqtSignal(str, str)    # status, color
+# Railway configuration - MODIFIED FOR RAILWAY
+PORT = int(os.environ.get("PORT", 5000))
+HOST = '0.0.0.0'  # Railway requires 0.0.0.0
 
-class SimpleChatClient(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("🔗 Simple Chat Client - Railway Compatible")
-        self.resize(1000, 700)
-        
-        # Connection variables
-        self.socket = None
-        self.username = ""
-        self.connected = False
-        self.peers = []
-        
-        # Signal handler
-        self.signals = MessageSignal()
-        self.signals.message_received.connect(self.display_message)
-        self.signals.peer_list_updated.connect(self.update_peer_list)
-        self.signals.system_message.connect(self.display_system_message)
-        self.signals.status_changed.connect(self.update_status)
-        
-        self.init_ui()
-        self.apply_styles()
+# MongoDB configuration - UPDATED FOR RAILWAY MONGODB
+MONGODB_URL = os.environ.get("MONGO_URL")  # Railway MongoDB addon provides this
+MONGODB_HOST = os.environ.get("MONGODB_HOST", "localhost")
+MONGODB_PORT = int(os.environ.get("MONGODB_PORT", "27017"))
+MONGODB_DB = os.environ.get("MONGODB_DB", "secure_chat")
+MONGODB_USERNAME = os.environ.get("MONGODB_USERNAME", "")
+MONGODB_PASSWORD = os.environ.get("MONGODB_PASSWORD", "")
 
-    def init_ui(self):
-        """Initialize the user interface"""
-        main_layout = QVBoxLayout()
-        
-        # Title
-        title_label = QLabel("🔗 Simple Chat Client")
-        title_label.setAlignment(Qt.AlignCenter)
-        title_label.setFont(QFont("Arial", 16, QFont.Bold))
-        main_layout.addWidget(title_label)
-        
-        # Connection section
-        conn_frame = QFrame()
-        conn_frame.setFrameStyle(QFrame.Box)
-        conn_layout = QHBoxLayout()
-        
-        # Connection inputs
-        conn_layout.addWidget(QLabel("Username:"))
-        self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("Enter your username")
-        conn_layout.addWidget(self.username_input)
-        
-        conn_layout.addWidget(QLabel("Server:"))
-        self.server_input = QLineEdit("secure-chat-server-production.up.railway.app")
-        conn_layout.addWidget(self.server_input)
-        
-        conn_layout.addWidget(QLabel("Port:"))
-        self.port_input = QLineEdit("5000")
-        self.port_input.setFixedWidth(80)
-        conn_layout.addWidget(self.port_input)
-        
-        # Connect button
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self.connect_to_server)
-        conn_layout.addWidget(self.connect_btn)
-        
-        # Disconnect button
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.clicked.connect(self.disconnect_from_server)
-        self.disconnect_btn.setEnabled(False)
-        conn_layout.addWidget(self.disconnect_btn)
-        
-        conn_frame.setLayout(conn_layout)
-        main_layout.addWidget(conn_frame)
-        
-        # Status bar
-        self.status_label = QLabel("🔴 Not connected")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(self.status_label)
-        
-        # Main content area
-        content_splitter = QSplitter(Qt.Horizontal)
-        
-        # Chat area
-        chat_widget = QWidget()
-        chat_layout = QVBoxLayout()
-        
-        # Chat display
-        self.chat_display = QTextEdit()
-        self.chat_display.setReadOnly(True)
-        self.chat_display.setFont(QFont("Consolas", 10))
-        chat_layout.addWidget(QLabel("💬 Chat Messages:"))
-        chat_layout.addWidget(self.chat_display)
-        
-        # Message input area
-        msg_frame = QFrame()
-        msg_frame.setFrameStyle(QFrame.Box)
-        msg_layout = QHBoxLayout()
-        
-        self.message_input = QLineEdit()
-        self.message_input.setPlaceholderText("Type your message here...")
-        self.message_input.returnPressed.connect(self.send_message)
-        msg_layout.addWidget(self.message_input)
-        
-        self.send_btn = QPushButton("Send")
-        self.send_btn.clicked.connect(self.send_message)
-        self.send_btn.setEnabled(False)
-        msg_layout.addWidget(self.send_btn)
-        
-        msg_frame.setLayout(msg_layout)
-        chat_layout.addWidget(msg_frame)
-        
-        chat_widget.setLayout(chat_layout)
-        content_splitter.addWidget(chat_widget)
-        
-        # Peers panel
-        peers_widget = QWidget()
-        peers_layout = QVBoxLayout()
-        
-        peers_layout.addWidget(QLabel("👥 Connected Peers:"))
-        self.peers_list = QListWidget()
-        self.peers_list.setFixedWidth(250)
-        peers_layout.addWidget(self.peers_list)
-        
-        # Connection info
-        self.info_display = QTextEdit()
-        self.info_display.setReadOnly(True)
-        self.info_display.setMaximumHeight(150)
-        self.info_display.setFont(QFont("Consolas", 9))
-        peers_layout.addWidget(QLabel("ℹ️ Connection Info:"))
-        peers_layout.addWidget(self.info_display)
-        
-        peers_widget.setLayout(peers_layout)
-        content_splitter.addWidget(peers_widget)
-        
-        content_splitter.setSizes([750, 250])
-        main_layout.addWidget(content_splitter)
-        
-        self.setLayout(main_layout)
+# Railway specific settings
+RAILWAY_STATIC_URL = os.environ.get("RAILWAY_STATIC_URL", "")
+RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 
-    def apply_styles(self):
-        """Apply modern styling to the application"""
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #f0f0f0;
-                font-family: 'Segoe UI', Arial, sans-serif;
-            }
-            
-            QFrame {
-                background-color: white;
-                border: 1px solid #d0d0d0;
-                border-radius: 5px;
-                padding: 5px;
-                margin: 2px;
-            }
-            
-            QLineEdit {
-                padding: 8px;
-                border: 2px solid #d0d0d0;
-                border-radius: 5px;
-                background-color: white;
-                font-size: 12px;
-            }
-            
-            QLineEdit:focus {
-                border-color: #4CAF50;
-            }
-            
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 5px;
-                font-weight: bold;
-                font-size: 12px;
-            }
-            
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            
-            QPushButton:pressed {
-                background-color: #3d8b40;
-            }
-            
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-            
-            QTextEdit {
-                border: 1px solid #d0d0d0;
-                border-radius: 5px;
-                background-color: white;
-                padding: 8px;
-            }
-            
-            QListWidget {
-                border: 1px solid #d0d0d0;
-                border-radius: 5px;
-                background-color: white;
-                padding: 5px;
-            }
-            
-            QListWidget::item {
-                padding: 5px;
-                border-bottom: 1px solid #e0e0e0;
-            }
-            
-            QListWidget::item:selected {
-                background-color: #4CAF50;
-                color: white;
-            }
-            
-            QLabel {
-                font-weight: bold;
-                color: #333333;
-                margin: 5px 0px;
-            }
-        """)
+MAX_CLIENTS = 50
+BUFFER_SIZE = 16384
 
-    def connect_to_server(self):
-        """Connect to the chat server"""
-        username = self.username_input.text().strip()
-        server = self.server_input.text().strip()
+# Client storage
+clients = {}
+client_usernames = {}
+username_to_socket = {}
+
+# MongoDB collections
+db = None
+users_collection = None
+messages_collection = None
+sessions_collection = None
+
+# Rate limiting
+connection_attempts = {}
+MAX_ATTEMPTS_PER_IP = 10
+RATE_LIMIT_WINDOW = timedelta(minutes=15)
+
+def init_database():
+    """Initialize MongoDB connection and collections - UPDATED FOR RAILWAY"""
+    global db, users_collection, messages_collection, sessions_collection
+    
+    try:
+        # Try Railway MongoDB URL first (preferred)
+        if MONGODB_URL:
+            logger.info(f"🔐 Connecting to Railway MongoDB via URL")
+            client = MongoClient(
+                MONGODB_URL,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000
+            )
+        elif MONGODB_USERNAME and MONGODB_PASSWORD:
+            # With authentication
+            connection_string = f"mongodb://{MONGODB_USERNAME}:{MONGODB_PASSWORD}@{MONGODB_HOST}:{MONGODB_PORT}/"
+            logger.info(f"🔐 Connecting to MongoDB with authentication at {MONGODB_HOST}:{MONGODB_PORT}")
+            client = MongoClient(
+                connection_string,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000
+            )
+        else:
+            # Without authentication (local development)
+            connection_string = f"mongodb://{MONGODB_HOST}:{MONGODB_PORT}/"
+            logger.info(f"🔓 Connecting to MongoDB without authentication at {MONGODB_HOST}:{MONGODB_PORT}")
+            client = MongoClient(
+                connection_string,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000
+            )
         
-        if not username:
-            QMessageBox.warning(self, "Input Error", "Please enter a username!")
-            return
-            
-        if not server:
-            QMessageBox.warning(self, "Input Error", "Please enter a server address!")
-            return
+        # Test the connection
+        client.admin.command('ping')
+        logger.info("✅ MongoDB connection successful")
         
+        # Get database and collections
+        db = client[MONGODB_DB]
+        users_collection = db.users
+        messages_collection = db.messages
+        sessions_collection = db.sessions
+        
+        # Create indexes for better performance
         try:
-            port = int(self.port_input.text())
-        except ValueError:
-            QMessageBox.warning(self, "Input Error", "Please enter a valid port number!")
-            return
+            users_collection.create_index("username", unique=True)
+            messages_collection.create_index([("timestamp", -1)])
+            sessions_collection.create_index([("last_activity", 1)], expireAfterSeconds=3600)
+            logger.info("📊 Database indexes created successfully")
+        except Exception as index_error:
+            logger.warning(f"⚠️ Index creation warning: {index_error}")
         
-        # Validate username
-        if len(username) > 50:
-            QMessageBox.warning(self, "Input Error", "Username too long (max 50 characters)!")
-            return
-            
-        if not username.replace('_', '').replace('-', '').isalnum():
-            QMessageBox.warning(self, "Input Error", 
-                              "Username can only contain letters, numbers, underscores, and hyphens!")
-            return
+        # Test basic operations
+        test_result = db.command("dbStats")
+        logger.info(f"📁 Database '{MONGODB_DB}' initialized - Collections: {len(db.list_collection_names())}")
         
-        # Get password
-        password, ok = QInputDialog.getText(
-            self, 
-            "Authentication", 
-            f"Enter password for user '{username}':\n(New users: create any password)",
-            QLineEdit.Password
-        )
+        return True
         
-        if not ok or not password:
-            return
-            
-        if len(password) > 128:
-            QMessageBox.warning(self, "Input Error", "Password too long (max 128 characters)!")
-            return
-        
-        self.username = username
-        
-        # Disable connection controls
-        self.connect_btn.setEnabled(False)
-        self.username_input.setEnabled(False)
-        self.server_input.setEnabled(False)
-        self.port_input.setEnabled(False)
-        
-        self.signals.status_changed.emit("Connecting...", "orange")
-        self.add_info_message(f"Attempting to connect to {server}:{port}...")
-        
-        # Start connection in separate thread
-        connection_thread = threading.Thread(
-            target=self._connect_worker, 
-            args=(server, port, username, password),
-            daemon=True
-        )
-        connection_thread.start()
+    except Exception as e:
+        logger.error(f"❌ MongoDB connection failed: {e}")
+        logger.warning("🔄 Falling back to in-memory storage")
+        logger.info("💡 For MongoDB setup on Railway: Add MongoDB addon or set MONGODB_URL")
+        return False
 
-    def _connect_worker(self, server, port, username, password):
-        """Worker thread for connection"""
-        try:
-            # Create socket
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(15)
-            
-            # Connect
-            self.socket.connect((server, port))
-            self.signals.system_message.emit(f"Connected to {server}:{port}")
-            
-            # Create dummy public key for compatibility
-            dummy_public_key = f"-----BEGIN PUBLIC KEY-----\nDUMMY_KEY_FOR_TESTING_{username}\n-----END PUBLIC KEY-----"
-            
-            # Send authentication
-            auth_data = {
-                "username": username,
-                "public_key": dummy_public_key,
-                "auth": password
-            }
-            
-            auth_json = json.dumps(auth_data)
-            self.socket.sendall(auth_json.encode('utf-8'))
-            
-            self.signals.status_changed.emit("Authenticating...", "orange")
-            self.signals.system_message.emit("Authentication data sent, waiting for response...")
-            
-            # Start message listener
-            self.connected = True
-            listener_thread = threading.Thread(target=self._message_listener, daemon=True)
-            listener_thread.start()
-            
-        except socket.timeout:
-            self.signals.system_message.emit("❌ Connection timeout!")
-            self._connection_failed()
-        except ConnectionRefusedError:
-            self.signals.system_message.emit("❌ Connection refused by server!")
-            self._connection_failed()
-        except Exception as e:
-            self.signals.system_message.emit(f"❌ Connection error: {e}")
-            self._connection_failed()
+def hash_password(password):
+    """Simple password hashing with salt"""
+    salt = "secure_chat_2024"  # In production, use random salt per user
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
-    def _connection_failed(self):
-        """Handle connection failure"""
-        self.connected = False
-        if self.socket:
-            try:
-                self.socket.close()
-            except:
-                pass
-            self.socket = None
+def check_rate_limit(client_ip):
+    """Check if IP is rate limited"""
+    now = datetime.now()
+    
+    if client_ip in connection_attempts:
+        attempt_info = connection_attempts[client_ip]
         
-        self.signals.status_changed.emit("Connection Failed", "red")
+        if now - attempt_info["last_attempt"] > RATE_LIMIT_WINDOW:
+            connection_attempts[client_ip] = {"count": 1, "last_attempt": now}
+            return True
         
-        # Re-enable connection controls
-        self.connect_btn.setEnabled(True)
-        self.username_input.setEnabled(True)
-        self.server_input.setEnabled(True)
-        self.port_input.setEnabled(True)
+        if attempt_info["count"] >= MAX_ATTEMPTS_PER_IP:
+            return False
+        
+        connection_attempts[client_ip]["count"] += 1
+        connection_attempts[client_ip]["last_attempt"] = now
+        return True
+    else:
+        connection_attempts[client_ip] = {"count": 1, "last_attempt": now}
+        return True
 
-    def _message_listener(self):
-        """Listen for messages from server"""
-        try:
-            while self.connected and self.socket:
-                try:
-                    # Set timeout for regular checks
-                    self.socket.settimeout(30)
-                    data = self.socket.recv(16384)
-                    
-                    if not data:
-                        self.signals.system_message.emit("Server disconnected")
-                        break
-                    
-                    # Process received data
-                    try:
-                        data_str = data.decode('utf-8')
-                        
-                        # Handle single JSON message
-                        try:
-                            message = json.loads(data_str)
-                            self._process_message(message)
-                        except json.JSONDecodeError:
-                            # Try to handle multiple JSON objects
-                            lines = data_str.strip().split('\n')
-                            for line in lines:
-                                if line.strip():
-                                    try:
-                                        message = json.loads(line.strip())
-                                        self._process_message(message)
-                                    except json.JSONDecodeError:
-                                        continue
-                                        
-                    except UnicodeDecodeError as e:
-                        self.signals.system_message.emit(f"Unicode decode error: {e}")
-                        continue
-                        
-                except socket.timeout:
-                    # Send keepalive
-                    try:
-                        ping = json.dumps({"type": "ping"})
-                        self.socket.sendall(ping.encode())
-                    except:
-                        break
-                    continue
-                except Exception as e:
-                    self.signals.system_message.emit(f"Message receive error: {e}")
-                    break
-                    
-        except Exception as e:
-            self.signals.system_message.emit(f"Listener error: {e}")
-        finally:
-            self._handle_disconnection()
-
-    def _process_message(self, message):
-        """Process incoming messages"""
-        msg_type = message.get("type")
-        
-        if msg_type == "auth_result":
-            status = message.get("status")
-            msg_text = message.get("message", "")
+def authenticate_user(username, password, public_key):
+    """Authenticate user or create new account with MongoDB"""
+    if not username or not password or not public_key:
+        return {"status": "fail", "message": "Missing credentials"}
+    
+    if len(username) > 50 or not username.replace('_', '').replace('-', '').isalnum():
+        return {"status": "fail", "message": "Invalid username format"}
+    
+    if len(password) > 128:
+        return {"status": "fail", "message": "Password too long"}
+    
+    password_hash = hash_password(password)
+    
+    try:
+        if users_collection:
+            # MongoDB storage
+            existing_user = users_collection.find_one({"username": username})
             
-            if status == "success":
-                self.signals.system_message.emit(f"✅ Login successful! {msg_text}")
-                self.signals.status_changed.emit("Connected & Authenticated", "green")
-                self._enable_chat()
-            elif status == "new_user":
-                self.signals.system_message.emit(f"🆕 Account created! {msg_text}")
-                self.signals.status_changed.emit("Connected & Authenticated", "green")
-                self._enable_chat()
-            elif status in ["fail", "error"]:
-                self.signals.system_message.emit(f"❌ Authentication failed: {msg_text}")
-                self.signals.status_changed.emit("Authentication Failed", "red")
-                self.disconnect_from_server()
-        
-        elif msg_type == "peer_list":
-            peers = message.get("peers", [])
-            peer_names = []
-            for peer in peers:
-                if isinstance(peer, dict):
-                    peer_names.append(peer.get("username", "Unknown"))
+            if existing_user:
+                if existing_user["password_hash"] == password_hash:
+                    # Update user info
+                    users_collection.update_one(
+                        {"username": username},
+                        {
+                            "$set": {
+                                "public_key": public_key,
+                                "last_login": datetime.utcnow()
+                            }
+                        }
+                    )
+                    logger.info(f"🔐 User {username} authenticated successfully")
+                    return {"status": "success", "message": "Welcome back!"}
                 else:
-                    peer_names.append(str(peer))
-            
-            # Remove self from peer list
-            if self.username in peer_names:
-                peer_names.remove(self.username)
-                
-            self.signals.peer_list_updated.emit(peer_names)
-            self.signals.system_message.emit(f"Peer list updated: {len(peer_names)} peers online")
-        
-        elif msg_type == "message":
-            sender = message.get("from", "Unknown")
-            # Since we're not using encryption, we'll display a placeholder
-            msg_text = "[Encrypted message - encryption not supported in test client]"
-            self.signals.message_received.emit(sender, msg_text)
-        
-        elif msg_type == "ping":
-            # Respond to server ping
-            try:
-                pong = json.dumps({"type": "pong"})
-                self.socket.sendall(pong.encode())
-            except:
-                pass
-        
-        elif msg_type == "error":
-            error_msg = message.get("message", "Unknown error")
-            self.signals.system_message.emit(f"Server error: {error_msg}")
+                    logger.warning(f"❌ Invalid password for user {username}")
+                    return {"status": "fail", "message": "Invalid password"}
+            else:
+                # Create new user
+                user_data = {
+                    "username": username,
+                    "password_hash": password_hash,
+                    "public_key": public_key,
+                    "created_at": datetime.utcnow(),
+                    "last_login": datetime.utcnow()
+                }
+                users_collection.insert_one(user_data)
+                logger.info(f"👤 New user {username} created successfully")
+                return {"status": "new_user", "message": "Account created successfully!"}
         
         else:
-            self.signals.system_message.emit(f"Unknown message type: {msg_type}")
+            # Fallback to in-memory storage (original code)
+            user_database = getattr(authenticate_user, 'user_database', {})
+            
+            if username in user_database:
+                if user_database[username]["password_hash"] == password_hash:
+                    user_database[username]["public_key"] = public_key
+                    user_database[username]["last_login"] = datetime.now()
+                    return {"status": "success", "message": "Welcome back!"}
+                else:
+                    return {"status": "fail", "message": "Invalid password"}
+            else:
+                user_database[username] = {
+                    "password_hash": password_hash,
+                    "public_key": public_key,
+                    "last_login": datetime.now()
+                }
+                authenticate_user.user_database = user_database
+                return {"status": "new_user", "message": "Account created successfully!"}
+                
+    except Exception as e:
+        logger.error(f"❌ Authentication error: {e}")
+        return {"status": "fail", "message": "Authentication error. Please try again."}
 
-    def _enable_chat(self):
-        """Enable chat functionality after successful authentication"""
-        self.send_btn.setEnabled(True)
-        self.message_input.setEnabled(True)
-        self.disconnect_btn.setEnabled(True)
-        self.add_info_message("✅ Chat enabled - you can now send messages")
+def get_user_public_key(username):
+    """Get user's public key from database"""
+    try:
+        if users_collection:
+            user = users_collection.find_one({"username": username})
+            return user["public_key"] if user else None
+        else:
+            # Fallback to in-memory
+            user_database = getattr(authenticate_user, 'user_database', {})
+            return user_database.get(username, {}).get("public_key")
+    except Exception as e:
+        logger.error(f"❌ Error getting public key for {username}: {e}")
+        return None
 
-    def _handle_disconnection(self):
-        """Handle disconnection cleanup"""
-        self.connected = False
-        if self.socket:
-            try:
-                self.socket.close()
-            except:
-                pass
-            self.socket = None
-        
-        self.signals.status_changed.emit("Disconnected", "red")
-        self.signals.peer_list_updated.emit([])
-        
-        # Reset UI state
-        self.connect_btn.setEnabled(True)
-        self.disconnect_btn.setEnabled(False)
-        self.send_btn.setEnabled(False)
-        self.message_input.setEnabled(False)
-        self.username_input.setEnabled(True)
-        self.server_input.setEnabled(True)
-        self.port_input.setEnabled(True)
+def log_message(sender, recipient, message_type, metadata=None):
+    """Log message to database for audit purposes"""
+    try:
+        if messages_collection:
+            message_log = {
+                "sender": sender,
+                "recipient": recipient,
+                "message_type": message_type,
+                "timestamp": datetime.utcnow(),
+                "metadata": metadata or {}
+            }
+            messages_collection.insert_one(message_log)
+    except Exception as e:
+        logger.error(f"❌ Error logging message: {e}")
 
-    def disconnect_from_server(self):
-        """Disconnect from server"""
-        self.connected = False
-        if self.socket:
-            try:
-                self.socket.close()
-            except:
-                pass
-            self.socket = None
-        
-        self.signals.system_message.emit("Disconnected from server")
-        self._handle_disconnection()
+def update_user_session(username, status="online"):
+    """Update user session status"""
+    try:
+        if sessions_collection:
+            sessions_collection.update_one(
+                {"username": username},
+                {
+                    "$set": {
+                        "status": status,
+                        "last_activity": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+    except Exception as e:
+        logger.error(f"❌ Error updating session for {username}: {e}")
 
-    def send_message(self):
-        """Send a message to selected peer"""
-        message_text = self.message_input.text().strip()
-        if not message_text:
-            return
+def broadcast_peer_list():
+    """Send updated peer list to all authenticated clients"""
+    peer_list = []
+    
+    try:
+        if users_collection:
+            # Get public keys from database for active users
+            for sock, username in client_usernames.items():
+                public_key = get_user_public_key(username)
+                if public_key:
+                    peer_list.append({
+                        "username": username,
+                        "public_key": public_key
+                    })
+        else:
+            # Fallback to in-memory
+            user_database = getattr(authenticate_user, 'user_database', {})
+            for sock, username in client_usernames.items():
+                if username in user_database:
+                    peer_list.append({
+                        "username": username,
+                        "public_key": user_database[username]["public_key"]
+                    })
         
-        selected_items = self.peers_list.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Peer Selected", "Please select a peer to send the message to!")
-            return
-        
-        recipient = selected_items[0].text()
-        
-        if not self.connected or not self.socket:
-            QMessageBox.warning(self, "Not Connected", "Not connected to server!")
-            return
-        
-        # Note: Since this is a test client without encryption,
-        # we'll send a simple unencrypted message with a warning
-        simple_message = {
-            "type": "test_message",
-            "to": recipient,
-            "from": self.username,
-            "message": f"[UNENCRYPTED TEST] {message_text}"
+        peer_message = {
+            "type": "peer_list",
+            "peers": peer_list
         }
+        
+        message_data = json.dumps(peer_message).encode()
+        
+        disconnected_clients = []
+        for client_socket in list(client_usernames.keys()):
+            try:
+                client_socket.sendall(message_data)
+            except Exception as e:
+                logger.warning(f"Failed to send peer list to client: {e}")
+                disconnected_clients.append(client_socket)
+        
+        for client_socket in disconnected_clients:
+            remove_client(client_socket)
+            
+    except Exception as e:
+        logger.error(f"❌ Error broadcasting peer list: {e}")
+
+def remove_client(client_socket):
+    """Remove client from all tracking structures"""
+    try:
+        username = None
+        if client_socket in client_usernames:
+            username = client_usernames[client_socket]
+            del client_usernames[client_socket]
+            
+            if username in username_to_socket:
+                del username_to_socket[username]
+            
+            # Update session status
+            update_user_session(username, "offline")
+            
+            logger.info(f"👋 User {username} disconnected")
+        
+        if client_socket in clients:
+            del clients[client_socket]
         
         try:
-            message_json = json.dumps(simple_message)
-            self.socket.sendall(message_json.encode('utf-8'))
+            client_socket.close()
+        except:
+            pass
+        
+        # Only broadcast if there are still clients
+        if client_usernames:
+            broadcast_peer_list()
             
-            # Display in chat
-            timestamp = time.strftime("%H:%M:%S")
-            self.chat_display.append(f"[{timestamp}] You to {recipient}: {message_text}")
-            self.message_input.clear()
+    except Exception as e:
+        logger.error(f"Error removing client: {e}")
+
+def is_http_request(data):
+    """Check if incoming data is an HTTP request"""
+    try:
+        if len(data) == 0:
+            return False
+        decoded = data.decode('utf-8', errors='ignore')
+        http_methods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH']
+        first_line = decoded.split('\n')[0].strip()
+        return any(first_line.startswith(method + ' ') for method in http_methods)
+    except:
+        return False
+
+def send_http_response(client_socket):
+    """Send HTTP response for web browsers accessing the server - UPDATED FOR RAILWAY"""
+    try:
+        # Get stats from database if available
+        total_users = 0
+        if users_collection:
+            try:
+                total_users = users_collection.count_documents({})
+            except:
+                pass
+        else:
+            user_database = getattr(authenticate_user, 'user_database', {})
+            total_users = len(user_database)
+        
+        connected_users = len(client_usernames)
+        
+        # Database status
+        db_status = "✅ MongoDB Connected" if db else "⚠️ In-Memory Storage"
+        
+        # Railway domain info
+        railway_domain = RAILWAY_PUBLIC_DOMAIN or f"your-app.railway.app"
+        
+    except:
+        total_users = 0
+        connected_users = 0
+        db_status = "❌ Database Error"
+        railway_domain = "your-app.railway.app"
+    
+    response = f"""HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Connection: close
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, OPTIONS
+Access-Control-Allow-Headers: Content-Type
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>🔐 Secure Chat Server - Railway Deployment</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            max-width: 800px; 
+            margin: 50px auto; 
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+        }}
+        .container {{
+            background: rgba(255, 255, 255, 0.95);
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+        }}
+        .status {{ color: #28a745; font-weight: bold; font-size: 20px; text-align: center; }}
+        .info {{ 
+            background: linear-gradient(135deg, #e3f2fd 0%, #f8f9ff 100%);
+            padding: 20px; 
+            border-radius: 15px; 
+            margin: 25px 0;
+            border-left: 5px solid #2196f3;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }}
+        .warning {{ 
+            color: #e65100; 
+            background: linear-gradient(135deg, #fff3e0 0%, #fff8e1 100%);
+            padding: 20px;
+            border-radius: 15px;
+            border-left: 5px solid #ff9800;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        }}
+        .stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }}
+        .stat-item {{
+            text-align: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
+            border-radius: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            transition: transform 0.3s ease;
+        }}
+        .stat-item:hover {{
+            transform: translateY(-5px);
+        }}
+        .stat-number {{
+            font-size: 32px;
+            font-weight: bold;
+            color: #2196f3;
+            margin-bottom: 5px;
+        }}
+        .stat-label {{
+            color: #666;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        h1 {{ 
+            color: #2c3e50; 
+            text-align: center; 
+            font-size: 2.5em;
+            margin-bottom: 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }}
+        h3 {{ 
+            color: #34495e; 
+            margin-bottom: 15px;
+            font-size: 1.3em;
+        }}
+        ul {{ 
+            line-height: 1.8; 
+            margin-left: 20px;
+        }}
+        li {{ 
+            margin: 8px 0; 
+        }}
+        .database-status {{
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 12px;
+            background: #e8f5e8;
+            color: #2e7d2e;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 40px;
+            padding: 20px;
+            color: #666;
+            font-size: 14px;
+        }}
+        @keyframes pulse {{
+            0% {{ opacity: 1; }}
+            50% {{ opacity: 0.7; }}
+            100% {{ opacity: 1; }}
+        }}
+        .online {{ animation: pulse 2s infinite; }}
+        .railway-info {{
+            background: linear-gradient(135deg, #f3e5f5 0%, #e8eaf6 100%);
+            padding: 20px;
+            border-radius: 15px;
+            border-left: 5px solid #9c27b0;
+            margin: 25px 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Secure Chat Server</h1>
+        <p class="status online">✅ Server is running on Railway and accepting connections!</p>
+        
+        <div class="stats">
+            <div class="stat-item">
+                <div class="stat-number">{connected_users}</div>
+                <div class="stat-label">Connected Users</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-number">{total_users}</div>
+                <div class="stat-label">Total Registered</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-number">{PORT}</div>
+                <div class="stat-label">Server Port</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-number">{MAX_CLIENTS}</div>
+                <div class="stat-label">Max Capacity</div>
+            </div>
+        </div>
+        
+        <div class="railway-info">
+            <h3>🚀 Railway Deployment Info</h3>
+            <p><strong>Public Domain:</strong> {railway_domain}</p>
+            <p><strong>Environment:</strong> Railway Cloud Platform</p>
+            <p><strong>Database:</strong> <span class="database-status">{db_status}</span></p>
+            <p>Your chat server is deployed on Railway with automatic HTTPS, global CDN, and persistent storage.</p>
+        </div>
+        
+        <div class="info">
+            <h3>📱 For Desktop Clients:</h3>
+            <ul>
+                <li><strong>Server Address:</strong> {railway_domain}</li>
+                <li><strong>Port:</strong> {PORT}</li>
+                <li><strong>Connection Type:</strong> TCP Socket Connection</li>
+                <li><strong>Protocol:</strong> JSON over TCP with End-to-End Encryption</li>
+                <li><strong>Security:</strong> RSA + AES-256 hybrid encryption</li>
+            </ul>
+        </div>
+        
+        <div class="info">
+            <h3>🔧 Technical Specifications:</h3>
+            <ul>
+                <li><strong>Platform:</strong> Railway Cloud with MongoDB</li>
+                <li><strong>Runtime:</strong> Python 3.11+ with PyMongo</li>
+                <li><strong>Maximum Clients:</strong> {MAX_CLIENTS} simultaneous connections</li>
+                <li><strong>Buffer Size:</strong> {BUFFER_SIZE:,} bytes per message</li>
+                <li><strong>Rate Limiting:</strong> {MAX_ATTEMPTS_PER_IP} attempts per 15 minutes</li>
+                <li><strong>Features:</strong> File transfer, Group messaging, User authentication</li>
+            </ul>
+        </div>
+        
+        <div class="warning">
+            <h3>⚠️ Important Information:</h3>
+            <ul>
+                <li><strong>Desktop Only:</strong> This server requires the desktop client application</li>
+                <li><strong>Web Incompatible:</strong> Browsers cannot connect to TCP socket servers</li>
+                <li><strong>End-to-End Encrypted:</strong> All messages use RSA + AES-256 encryption</li>
+                <li><strong>Persistent Storage:</strong> User accounts and sessions are saved in MongoDB</li>
+                <li><strong>File Support:</strong> Secure file transfer with integrity verification</li>
+            </ul>
+        </div>
+        
+        <div class="footer">
+            <p>🚀 Deployed on Railway | 🔐 Secured by RSA-2048 + AES-256</p>
+            <p>© 2024 Secure Chat Server - End-to-End Encrypted Messaging</p>
+        </div>
+    </div>
+</body>
+</html>"""
+    
+    try:
+        client_socket.sendall(response.encode())
+        time.sleep(0.1)
+        client_socket.close()
+    except Exception as e:
+        logger.warning(f"Failed to send HTTP response: {e}")
+
+def send_safe_json_response(client_socket, response_data):
+    """Safely send JSON response to client"""
+    try:
+        response_json = json.dumps(response_data)
+        response_bytes = response_json.encode('utf-8')
+        client_socket.sendall(response_bytes)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send JSON response: {e}")
+        return False
+
+def handle_client(client_socket, client_address):
+    """Handle individual client connection"""
+    logger.info(f"New connection from {client_address}")
+    
+    client_ip = client_address[0]
+    if not check_rate_limit(client_ip):
+        logger.warning(f"Rate limit exceeded for {client_ip}")
+        error_response = {
+            "type": "auth_result",
+            "status": "error",
+            "message": "Too many connection attempts. Please try again later."
+        }
+        send_safe_json_response(client_socket, error_response)
+        try:
+            client_socket.close()
+        except:
+            pass
+        return
+    
+    clients[client_socket] = {
+        "address": client_address,
+        "authenticated": False,
+        "username": None
+    }
+    
+    try:
+        client_socket.settimeout(60)
+        initial_data = client_socket.recv(BUFFER_SIZE)
+        
+        if not initial_data:
+            logger.warning(f"No initial data received from {client_address}")
+            return
+        
+        logger.info(f"Received {len(initial_data)} bytes from {client_address}")
+        
+        if is_http_request(initial_data):
+            logger.info(f"HTTP request detected from {client_address}, sending web response")
+            send_http_response(client_socket)
+            return
+        
+        try:
+            data_str = initial_data.decode('utf-8')
+            
+            brace_count = 0
+            json_end = -1
+            for i, char in enumerate(data_str):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
+            
+            if json_end > 0:
+                json_str = data_str[:json_end]
+                auth_payload = json.loads(json_str)
+            else:
+                auth_payload = json.loads(data_str)
+            
+            logger.info(f"Parsed auth payload from {client_address}: {list(auth_payload.keys())}")
+            
+            required_fields = ["username", "auth", "public_key"]
+            missing_fields = [field for field in required_fields if field not in auth_payload]
+            
+            if missing_fields:
+                logger.warning(f"Missing auth fields from {client_address}: {missing_fields}")
+                error_response = {
+                    "type": "auth_result",
+                    "status": "error",
+                    "message": f"Missing authentication fields: {', '.join(missing_fields)}"
+                }
+                send_safe_json_response(client_socket, error_response)
+                return
+            
+            username = auth_payload.get("username", "").strip()
+            password = auth_payload.get("auth", "")
+            public_key = auth_payload.get("public_key", "")
+            
+            logger.info(f"Authentication attempt from {client_address} for user: {username}")
+            
+            auth_result = authenticate_user(username, password, public_key)
+            
+            response = {
+                "type": "auth_result",
+                **auth_result
+            }
+            
+            if not send_safe_json_response(client_socket, response):
+                logger.error(f"Failed to send auth response to {client_address}")
+                return
+            
+            logger.info(f"Auth result sent to {client_address}: {auth_result['status']}")
+            
+            if auth_result["status"] in ["success", "new_user"]:
+                clients[client_socket]["authenticated"] = True
+                clients[client_socket]["username"] = username
+                client_usernames[client_socket] = username
+                username_to_socket[username] = client_socket
+                
+                update_user_session(username, "online")
+                
+                logger.info(f"User {username} authenticated from {client_address}")
+                
+                client_socket.settimeout(None)
+                
+                broadcast_peer_list()
+                
+                handle_authenticated_client(client_socket, username)
+            else:
+                logger.warning(f"Authentication failed for {username} from {client_address}: {auth_result['message']}")
+                time.sleep(1)
+                return
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON format from {client_address}: {e}")
+            logger.debug(f"Received data (first 500 chars): {initial_data[:500]}")
+            
+            error_response = {
+                "type": "auth_result",
+                "status": "error",
+                "message": "Invalid authentication data format. Please ensure you're using the desktop client."
+            }
+            send_safe_json_response(client_socket, error_response)
+            return
+            
+        except UnicodeDecodeError as e:
+            logger.error(f"Unicode decode error from {client_address}: {e}")
+            error_response = {
+                "type": "auth_result",
+                "status": "error",
+                "message": "Invalid character encoding in request"
+            }
+            send_safe_json_response(client_socket, error_response)
+            return
             
         except Exception as e:
-            self.signals.system_message.emit(f"Failed to send message: {e}")
+            logger.error(f"Auth processing error for {client_address}: {e}")
+            error_response = {
+                "type": "auth_result",
+                "status": "error",
+                "message": "Authentication processing error. Please try again."
+            }
+            send_safe_json_response(client_socket, error_response)
+            return
+            
+    except socket.timeout:
+        logger.warning(f"Authentication timeout for {client_address}")
+    except ConnectionResetError:
+        logger.info(f"Connection reset by {client_address}")
+    except Exception as e:
+        logger.error(f"Client handling error for {client_address}: {e}")
+    finally:
+        remove_client(client_socket)
 
-    def display_message(self, sender, message):
-        """Display received message"""
-        timestamp = time.strftime("%H:%M:%S")
-        self.chat_display.append(f"[{timestamp}] {sender}: {message}")
+def handle_authenticated_client(client_socket, username):
+    """Handle messages from authenticated client"""
+    logger.info(f"Starting message handler for user: {username}")
+    
+    try:
+        while True:
+            try:
+                client_socket.settimeout(300)
+                data = client_socket.recv(BUFFER_SIZE)
+                
+                if not data:
+                    logger.info(f"{username} disconnected (no data)")
+                    break
+                
+                client_socket.settimeout(None)
+                
+                try:
+                    message = json.loads(data.decode('utf-8'))
+                    route_message(client_socket, username, message)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid message format from {username}: {e}")
+                    continue
+                except UnicodeDecodeError as e:
+                    logger.warning(f"Unicode decode error from {username}: {e}")
+                    continue
+                    
+            except socket.timeout:
+                logger.info(f"Timeout waiting for message from {username}")
+                try:
+                    ping_message = json.dumps({"type": "ping"})
+                    client_socket.sendall(ping_message.encode())
+                except:
+                    logger.info(f"Failed to ping {username}, disconnecting")
+                    break
+                continue
+            except ConnectionResetError:
+                logger.info(f"Connection reset by {username}")
+                break
+            except Exception as e:
+                logger.error(f"Message receiving error from {username}: {e}")
+                break
+                
+    except Exception as e:
+        logger.error(f"Connection error with {username}: {e}")
 
-    def display_system_message(self, message):
-        """Display system message"""
-        timestamp = time.strftime("%H:%M:%S")
-        self.chat_display.append(f"[{timestamp}] SYSTEM: {message}")
-
-    def update_peer_list(self, peers):
-        """Update the peers list"""
-        self.peers = peers
-        self.peers_list.clear()
-        for peer in peers:
-            self.peers_list.addItem(peer)
+def route_message(sender_socket, sender_username, message):
+    """Route message to appropriate recipient"""
+    try:
+        msg_type = message.get("type")
+        recipient = message.get("to")
         
-        self.add_info_message(f"Online peers: {len(peers)}")
-
-    def update_status(self, status, color):
-        """Update status label"""
-        color_symbols = {
-            "red": "🔴",
-            "green": "🟢", 
-            "orange": "🟡"
-        }
-        symbol = color_symbols.get(color, "🔴")
-        self.status_label.setText(f"{symbol} {status}")
+        if not recipient:
+            logger.warning(f"No recipient specified in message from {sender_username}")
+            return
         
-        # Apply color styling
-        color_codes = {
-            "red": "#ff4444",
-            "green": "#44ff44",
-            "orange": "#ffaa44"
-        }
-        color_code = color_codes.get(color, "#ff4444")
-        self.status_label.setStyleSheet(f"color: {color_code}; font-weight: bold; padding: 5px;")
+        # Find recipient socket
+        recipient_socket = username_to_socket.get(recipient)
+        if not recipient_socket:
+            logger.warning(f"Recipient {recipient} not found for message from {sender_username}")
+            # Send error back to sender
+            error_msg = {
+                "type": "error",
+                "message": f"User {recipient} is not online"
+            }
+            try:
+                sender_socket.sendall(json.dumps(error_msg).encode())
+            except:
+                pass
+            return
+        
+        try:
+            # Forward the message to recipient
+            message_data = json.dumps(message).encode()
+            recipient_socket.sendall(message_data)
+            
+            # Log message to database
+            metadata = {}
+            if msg_type == "message":
+                logger.info(f"💬 Message: {sender_username} -> {recipient}")
+                metadata = {"encrypted": True}
+            elif msg_type == "key_exchange":
+                logger.info(f"🔑 Key exchange: {sender_username} -> {recipient}")
+                metadata = {"key_type": "public_key"}
+            elif msg_type == "file_header":
+                filename = message.get("filename", "unknown")
+                filesize = message.get("filesize", 0)
+                logger.info(f"📁 File start: {sender_username} -> {recipient}: '{filename}' ({filesize} bytes)")
+                metadata = {"filename": filename, "filesize": filesize, "transfer_status": "started"}
+            elif msg_type == "file_chunk":
+                logger.debug(f"📦 File chunk: {sender_username} -> {recipient}")
+                metadata = {"chunk_transfer": True}
+            elif msg_type == "file_end":
+                filename = message.get("filename", "unknown")  
+                logger.info(f"✅ File completed: {sender_username} -> {recipient}: '{filename}'")
+                metadata = {"filename": filename, "transfer_status": "completed"}
+            else:
+                logger.info(f"📨 Message type '{msg_type}': {sender_username} -> {recipient}")
+                metadata = {"message_type": msg_type}
+            
+            # Log to database (non-blocking)
+            try:
+                log_message(sender_username, recipient, msg_type, metadata)
+            except Exception as log_error:
+                logger.warning(f"Failed to log message: {log_error}")
+                
+        except Exception as e:
+            logger.error(f"Failed to forward message from {sender_username} to {recipient}: {e}")
+            # Remove disconnected recipient
+            if recipient_socket in client_usernames:
+                remove_client(recipient_socket)
+                
+    except Exception as e:
+        logger.error(f"Error routing message from {sender_username}: {e}")
 
-    def add_info_message(self, message):
-        """Add message to info display"""
-        timestamp = time.strftime("%H:%M:%S")
-        self.info_display.append(f"[{timestamp}] {message}")
+def cleanup_old_rate_limits():
+    """Clean up old rate limit entries periodically"""
+    while True:
+        try:
+            now = datetime.now()
+            expired_ips = [
+                ip for ip, info in connection_attempts.items()
+                if now - info["last_attempt"] > RATE_LIMIT_WINDOW
+            ]
+            
+            for ip in expired_ips:
+                del connection_attempts[ip]
+            
+            if expired_ips:
+                logger.info(f"🧹 Cleaned up {len(expired_ips)} expired rate limit entries")
+            
+            # Clean up every 10 minutes
+            time.sleep(600)
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+            time.sleep(60)
 
-    def closeEvent(self, event):
-        """Handle application close"""
-        if self.connected:
-            self.disconnect_from_server()
-        event.accept()
+def print_server_stats():
+    """Print server statistics periodically"""
+    while True:
+        try:
+            # Print stats every 10 minutes
+            time.sleep(600)
+            connected_users = len(client_usernames)
+            
+            # Get total users from database
+            total_users = 0
+            if users_collection:
+                try:
+                    total_users = users_collection.count_documents({})
+                except:
+                    pass
+            else:
+                user_database = getattr(authenticate_user, 'user_database', {})
+                total_users = len(user_database)
+            
+            rate_limited_ips = len(connection_attempts)
+            
+            logger.info(f"📊 Server Stats - Connected: {connected_users}, Total users: {total_users}, Rate-limited IPs: {rate_limited_ips}")
+            
+            if connected_users > 0:
+                usernames = list(client_usernames.values())
+                logger.info(f"👥 Online users: {', '.join(usernames)}")
+            
+            # Log database status
+            if db:
+                try:
+                    # Get recent message count
+                    if messages_collection:
+                        recent_messages = messages_collection.count_documents({
+                            "timestamp": {"$gte": datetime.utcnow() - timedelta(hours=24)}
+                        })
+                        logger.info(f"📨 Messages in last 24h: {recent_messages}")
+                except Exception as e:
+                    logger.warning(f"Failed to get message stats: {e}")
+                
+        except Exception as e:
+            logger.error(f"Stats error: {e}")
 
-def main():
-    app = QApplication(sys.argv)
-    
-    # Set application properties
-    app.setApplicationName("Simple Chat Client")
-    app.setApplicationVersion("1.0")
-    app.setOrganizationName("Railway Chat Test")
-    
-    # Create and show the main window
-    window = SimpleChatClient()
-    window.show()
-    
-        # Add welcome message with correct TCP endpoint
-        window.display_system_message("Welcome to Simple Chat Client!")
-        window.display_system_message("This is a test client without encryption for Railway server testing.")
-        window.display_system_message("Server: tramway.proxy.rlwy.net:42721 (Railway TCP Proxy)")
-        window.display_system_message("Enter your credentials and click Connect to get started.")
-    
-    sys.exit(app.exec_())
+def health_check():
+    """Perform periodic health checks"""
+    while True:
+        try:
+            time.sleep(300)  # Check every 5 minutes
+            
+            # Check database connection
+            if db:
+                try:
+                    db.command('ping')
+                    logger.debug("🔍 Database health check: OK")
+                except Exception as e:
+                    logger.error(f"❌ Database health check failed: {e}")
+            
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
 
+def start_server():
+    """Start the secure chat server"""
+    # Initialize database first
+    db_connected = init_database()
+    
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # Set socket options for better compatibility
+    try:
+        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except:
+        pass  # Not critical if this fails
+    
+    try:
+        server_socket.bind((HOST, PORT))
+        server_socket.listen(MAX_CLIENTS)
+        
+        logger.info("=" * 70)
+        logger.info("🔐 SECURE CHAT SERVER - RAILWAY DEPLOYMENT WITH MONGODB")
+        logger.info(f"🌐 Host: {HOST}")
+        logger.info(f"🔌 Port: {PORT}")
+        logger.info(f"👥 Max clients: {MAX_CLIENTS}")
+        logger.info(f"📦 Buffer size: {BUFFER_SIZE:,} bytes")
+        logger.info(f"💾 Database: {'MongoDB Connected' if db_connected else 'In-Memory Fallback'}")
+        if db_connected:
+            if MONGODB_URL:
+                logger.info(f"🏠 MongoDB: Railway MongoDB Service")
+            else:
+                logger.info(f"🏠 MongoDB: {MONGODB_HOST}:{MONGODB_PORT}/{MONGODB_DB}")
+        logger.info(f"🕐 Started: {datetime.now()}")
+        logger.info("=" * 70)
+        logger.info("✅ Server ready for connections...")
+        logger.info("🚀 Running on Railway - clients can connect globally!")
+        logger.info("🌐 HTTP requests will receive a status page")
+        logger.info("📊 All activities are logged to database")
+        logger.info("-" * 70)
+        
+        # Start background threads
+        cleanup_thread = threading.Thread(target=cleanup_old_rate_limits, daemon=True, name="Cleanup")
+        cleanup_thread.start()
+        
+        stats_thread = threading.Thread(target=print_server_stats, daemon=True, name="Stats")
+        stats_thread.start()
+        
+        health_thread = threading.Thread(target=health_check, daemon=True, name="HealthCheck")
+        health_thread.start()
+        
+        logger.info("🔄 Background threads started (Cleanup, Stats, HealthCheck)")
+        
+        # Main server loop
+        connection_count = 0
+        while True:
+            try:
+                client_socket, client_address = server_socket.accept()
+                connection_count += 1
+                
+                logger.info(f"🔌 Connection #{connection_count} from {client_address}")
+                
+                # Check server capacity
+                if len(clients) >= MAX_CLIENTS:
+                    logger.warning(f"🚫 Server at capacity ({MAX_CLIENTS}), rejecting {client_address}")
+                    error_response = {
+                        "type": "auth_result",
+                        "status": "error",
+                        "message": f"Server at capacity ({MAX_CLIENTS} users). Please try again later."
+                    }
+                    send_safe_json_response(client_socket, error_response)
+                    try:
+                        client_socket.close()
+                    except:
+                        pass
+                    continue
+                
+                # Set socket options for the client connection
+                try:
+                    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                except:
+                    pass  # Not critical if these fail
+                
+                # Start client handler thread
+                client_thread = threading.Thread(
+                    target=handle_client, 
+                    args=(client_socket, client_address),
+                    daemon=True,
+                    name=f"Client-{client_address[0]}-{client_address[1]}"
+                )
+                client_thread.start()
+                
+            except Exception as e:
+                logger.error(f"Error accepting connection: {e}")
+                time.sleep(1)  # Prevent rapid error loops
+                continue
+                
+    except KeyboardInterrupt:
+        logger.info("Server shutdown requested")
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info("🔄 Shutting down server...")
+        
+        # Close all client connections
+        for client_socket in list(clients.keys()):
+            try:
+                client_socket.close()
+            except:
+                pass
+        
+        # Close database connection
+        if db:
+            try:
+                # Update all sessions to offline
+                if sessions_collection:
+                    sessions_collection.update_many(
+                        {"status": "online"},
+                        {"$set": {"status": "offline", "last_activity": datetime.utcnow()}}
+                    )
+                logger.info("💾 Database cleanup completed")
+            except Exception as e:
+                logger.warning(f"Database cleanup error: {e}")
+        
+        try:
+            server_socket.close()
+        except:
+            pass
+            
+        logger.info("✅ Server shutdown complete")
+
+# Entry point
 if __name__ == "__main__":
-    main()
+    try:
+        start_server()
+    except Exception as e:
+        logger.error(f"Fatal server error: {e}")
+        logger.error(traceback.format_exc())
