@@ -202,25 +202,68 @@ def remove_client(client_socket):
         print(f"Error removing client: {e}")
 
 def handle_authenticated_client(client_socket, username):
-    """Handle messages from authenticated client"""
+    """Handle messages from authenticated client with better buffer handling"""
     print(f"💬 Message handler started for: {username}")
     
     try:
+        buffer = b""  # Buffer for incomplete messages
+        
         while True:
             try:
                 client_socket.settimeout(300)  # 5 minute timeout
-                data = client_socket.recv(8192)
+                data = client_socket.recv(16384)  # Larger buffer for file transfers
                 
                 if not data:
+                    print(f"📴 {username} disconnected")
                     break
                 
                 client_socket.settimeout(None)
                 
-                try:
-                    message = json.loads(data.decode('utf-8'))
-                    handle_message(client_socket, username, message)
-                except json.JSONDecodeError:
-                    print(f"Invalid JSON from {username}")
+                # Add to buffer
+                buffer += data
+                
+                # Process complete messages from buffer
+                while buffer:
+                    try:
+                        # Try to find a complete JSON message
+                        brace_count = 0
+                        start_found = False
+                        end_pos = -1
+                        
+                        for i, byte in enumerate(buffer):
+                            char = chr(byte)
+                            if char == '{':
+                                if not start_found:
+                                    start_found = True
+                                brace_count += 1
+                            elif char == '}' and start_found:
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end_pos = i
+                                    break
+                        
+                        if end_pos == -1:
+                            # No complete message yet, wait for more data
+                            break
+                        
+                        # Extract complete message
+                        message_data = buffer[:end_pos + 1]
+                        buffer = buffer[end_pos + 1:]
+                        
+                        # Process the message
+                        try:
+                            message_str = message_data.decode('utf-8')
+                            message = json.loads(message_str)
+                            handle_message(client_socket, username, message)
+                        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                            print(f"❌ Message decode error from {username}: {e}")
+                            print(f"📄 Problematic data: {message_data[:100]}...")
+                            continue
+                        
+                    except Exception as e:
+                        print(f"❌ Buffer processing error for {username}: {e}")
+                        buffer = b""  # Clear buffer on error
+                        break
                     
             except socket.timeout:
                 # Send ping
@@ -230,18 +273,19 @@ def handle_authenticated_client(client_socket, username):
                 except:
                     break
             except Exception as e:
-                print(f"Message error for {username}: {e}")
+                print(f"❌ Message receive error for {username}: {e}")
                 break
                 
     except Exception as e:
-        print(f"Client handler error for {username}: {e}")
+        print(f"❌ Client handler error for {username}: {e}")
     finally:
         remove_client(client_socket)
 
 def handle_message(client_socket, sender_username, message):
-    """Handle different message types"""
+    """Handle different message types with complete support"""
     try:
         msg_type = message.get("type")
+        print(f"📨 Processing {msg_type} from {sender_username}")
         
         if msg_type == "message":
             # Direct message
@@ -251,10 +295,22 @@ def handle_message(client_socket, sender_username, message):
                 try:
                     forward_msg = message.copy()
                     forward_msg["from"] = sender_username
+                    forward_msg["timestamp"] = datetime.utcnow().isoformat()
                     recipient_socket.sendall(json.dumps(forward_msg).encode())
                     print(f"💬 {sender_username} -> {recipient}")
-                except:
-                    pass
+                    
+                    # Send delivery confirmation
+                    confirm = {
+                        "type": "success",
+                        "message": "Message delivered",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    client_socket.sendall(json.dumps(confirm).encode())
+                except Exception as e:
+                    print(f"❌ Failed to deliver message: {e}")
+                    send_error(client_socket, "Failed to deliver message")
+            else:
+                send_error(client_socket, f"User {recipient} is not online")
         
         elif msg_type == "key_exchange":
             # Key exchange
@@ -264,19 +320,125 @@ def handle_message(client_socket, sender_username, message):
                 try:
                     forward_msg = message.copy()
                     forward_msg["from"] = sender_username
+                    forward_msg["timestamp"] = datetime.utcnow().isoformat()
                     recipient_socket.sendall(json.dumps(forward_msg).encode())
                     print(f"🔑 Key exchange: {sender_username} -> {recipient}")
                 except:
-                    pass
+                    send_error(client_socket, "Failed to send key")
+            else:
+                send_error(client_socket, f"User {recipient} is not online")
+        
+        elif msg_type == "file_header":
+            # File transfer start
+            recipient = message.get("to")
+            filename = message.get("filename", "unknown")
+            filesize = message.get("filesize", 0)
+            
+            if recipient and recipient in username_to_socket:
+                recipient_socket = username_to_socket[recipient]
+                try:
+                    forward_msg = message.copy()
+                    forward_msg["from"] = sender_username
+                    forward_msg["timestamp"] = datetime.utcnow().isoformat()
+                    recipient_socket.sendall(json.dumps(forward_msg).encode())
+                    print(f"📁 File transfer started: {sender_username} -> {recipient}: {filename} ({filesize} bytes)")
+                except:
+                    send_error(client_socket, "Failed to start file transfer")
+            else:
+                send_error(client_socket, f"User {recipient} is not online")
+        
+        elif msg_type == "file_chunk":
+            # File chunk
+            recipient = message.get("to")
+            if recipient and recipient in username_to_socket:
+                recipient_socket = username_to_socket[recipient]
+                try:
+                    forward_msg = message.copy()
+                    forward_msg["from"] = sender_username
+                    recipient_socket.sendall(json.dumps(forward_msg).encode())
+                    # Don't log every chunk to avoid spam
+                except:
+                    send_error(client_socket, "Failed to send file chunk")
+            else:
+                send_error(client_socket, f"User {recipient} is not online")
+        
+        elif msg_type == "file_end":
+            # File transfer complete
+            recipient = message.get("to")
+            filename = message.get("filename", "unknown")
+            
+            if recipient and recipient in username_to_socket:
+                recipient_socket = username_to_socket[recipient]
+                try:
+                    forward_msg = message.copy()
+                    forward_msg["from"] = sender_username
+                    forward_msg["timestamp"] = datetime.utcnow().isoformat()
+                    recipient_socket.sendall(json.dumps(forward_msg).encode())
+                    print(f"📁 File transfer completed: {sender_username} -> {recipient}: {filename}")
+                except:
+                    send_error(client_socket, "Failed to complete file transfer")
+            else:
+                send_error(client_socket, f"User {recipient} is not online")
+        
+        elif msg_type == "ping":
+            # Respond to ping with pong
+            try:
+                pong = {
+                    "type": "pong", 
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                client_socket.sendall(json.dumps(pong).encode())
+                print(f"🏓 Ping-pong with {sender_username}")
+            except:
+                pass
         
         elif msg_type == "pong":
+            # Acknowledge pong
             print(f"🏓 Pong from {sender_username}")
+        
+        elif msg_type == "typing_indicator":
+            # Forward typing indicator
+            recipient = message.get("to")
+            if recipient and recipient in username_to_socket:
+                recipient_socket = username_to_socket[recipient]
+                try:
+                    forward_msg = message.copy()
+                    forward_msg["from"] = sender_username
+                    recipient_socket.sendall(json.dumps(forward_msg).encode())
+                except:
+                    pass  # Ignore typing indicator failures
         
         else:
             print(f"❓ Unknown message type: {msg_type}")
+            send_error(client_socket, f"Unknown message type: {msg_type}")
             
     except Exception as e:
-        print(f"Message handling error: {e}")
+        print(f"❌ Message handling error: {e}")
+        send_error(client_socket, "Message processing error")
+
+def send_error(client_socket, error_message):
+    """Send error response to client"""
+    try:
+        error_response = {
+            "type": "error",
+            "message": error_message,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        client_socket.sendall(json.dumps(error_response).encode())
+    except Exception as e:
+        print(f"❌ Failed to send error: {e}")
+
+def send_success(client_socket, success_message):
+    """Send success response to client"""
+    try:
+        success_response = {
+            "type": "success",
+            "message": success_message,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        client_socket.sendall(json.dumps(success_response).encode())
+    except Exception as e:
+        print(f"❌ Failed to send success: {e}")
 
 def handle_client(client_socket, client_address):
     """Handle any client connection - EXACT COPY of working minimal server"""
