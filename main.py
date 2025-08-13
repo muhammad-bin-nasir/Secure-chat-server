@@ -76,19 +76,36 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         """Handle health check requests"""
         try:
+            # Simple, safe health response
             health_data = {
                 "status": "healthy",
                 "service": "Secure Chat Server",
                 "version": "1.0",
                 "port": PORT,
-                "connected_users": len(client_usernames),
-                "total_users": get_total_users(),
-                "active_channels": len(active_channels),
-                "uptime_seconds": int((datetime.utcnow() - server_stats["start_time"]).total_seconds()),
-                "messages_sent": server_stats["messages_sent"],
-                "database": "connected" if db else "in-memory",
                 "timestamp": datetime.utcnow().isoformat()
             }
+            
+            # Add safe stats
+            try:
+                health_data["connected_users"] = len(client_usernames)
+                health_data["active_channels"] = len(active_channels)
+                health_data["uptime_seconds"] = int((datetime.utcnow() - server_stats["start_time"]).total_seconds())
+                health_data["messages_sent"] = server_stats["messages_sent"]
+                
+                # Safe database check
+                if db is not None:
+                    health_data["database"] = "connected"
+                    try:
+                        health_data["total_users"] = users_collection.count_documents({})
+                    except:
+                        health_data["total_users"] = 0
+                else:
+                    health_data["database"] = "in-memory"
+                    health_data["total_users"] = len(getattr(authenticate_user, 'user_db', {}))
+                    
+            except Exception as e:
+                logger.debug(f"Stats error in health check: {e}")
+                # Continue with basic health data
             
             response = json.dumps(health_data, indent=2)
             
@@ -119,11 +136,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 def get_total_users():
     """Get total registered users"""
     try:
-        if users_collection:
+        if users_collection is not None:
             return users_collection.count_documents({})
         else:
             return len(getattr(authenticate_user, 'user_db', {}))
-    except:
+    except Exception as e:
+        logger.debug(f"Error getting user count: {e}")
         return 0
 
 def start_health_server():
@@ -189,7 +207,7 @@ def authenticate_user(username, password, public_key="", email=""):
     password_hash = hash_password(password)
     
     try:
-        if users_collection:
+        if users_collection is not None:
             # MongoDB storage
             user = users_collection.find_one({"username": username})
             if user:
@@ -241,13 +259,14 @@ def authenticate_user(username, password, public_key="", email=""):
 def get_user_public_key(username):
     """Get user's public key"""
     try:
-        if users_collection:
+        if users_collection is not None:
             user = users_collection.find_one({"username": username})
             return user.get("public_key", "") if user else ""
         else:
             user_db = getattr(authenticate_user, 'user_db', {})
             return user_db.get(username, {}).get("public_key", "")
-    except:
+    except Exception as e:
+        logger.debug(f"Error getting public key: {e}")
         return ""
 
 def broadcast_peer_list():
